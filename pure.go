@@ -47,7 +47,9 @@ func serverConfig(i *pb.InstanceSpec, maintenance bool) string {
 	b.WriteString("  <timezone>UTC</timezone>\n  <mlock_executable>false</mlock_executable>\n")
 	b.WriteString("  <send_crash_reports><enabled>false</enabled></send_crash_reports>\n")
 	if mb := i.GetLimits().GetMemoryMb(); mb > 0 {
-		fmt.Fprintf(&b, "  <max_server_memory_usage>%d</max_server_memory_usage>\n", int64(mb)<<20)
+		// The branch's memory setting is a cache budget; the server needs room of its own
+		// (about 140 MiB idle). The unit allows MemoryMB*2+512 MiB.
+		fmt.Fprintf(&b, "  <max_server_memory_usage>%d</max_server_memory_usage>\n", (int64(mb)*2+384)<<20)
 	}
 	b.WriteString("</clickhouse>\n")
 	return b.String()

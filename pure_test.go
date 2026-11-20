@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/xml"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -37,7 +38,7 @@ func TestServerConfig_データとログを指定の場所に置きHTTPだけを
 		"<path>/tank/db-branch/branches/x/</path>", "<tmp_path>/tank/db-branch/branches/x/tmp/</tmp_path>",
 		"<users_config>/var/lib/db-branch/instances/branch-x/users.xml</users_config>",
 		"<log>/var/lib/db-branch/instances/branch-x/clickhouse-server.log</log>",
-		"<max_server_memory_usage>1073741824</max_server_memory_usage>",
+		"<max_server_memory_usage>2550136832</max_server_memory_usage>", // (1024*2+384) MiB
 		"<user_files_path>/tank/db-branch/branches/x/user_files/</user_files_path>",
 	} {
 		if !strings.Contains(c, want) {
@@ -162,5 +163,15 @@ func TestSplitStatements_セミコロンで分け引用符の中は分けない(
 	}
 	if got := splitStatements("  ;; \n"); len(got) != 0 {
 		t.Fatalf("blank statements are dropped: %q", got)
+	}
+}
+
+func TestServerConfig_ブランチのメモリ設定はキャッシュ分でサーバー全体の上限は余裕を足す(t *testing.T) {
+	// ClickHouse itself needs about 140 MiB idle; the unit's MemoryMax is MemoryMB*2+512 MiB.
+	i := inst()
+	i.Limits = &pb.ResourceLimits{MemoryMb: 128}
+	c := serverConfig(i, false)
+	if !strings.Contains(c, "<max_server_memory_usage>"+strconv.FormatInt((128*2+384)<<20, 10)+"</max_server_memory_usage>") {
+		t.Fatalf("a small branch still needs room for the server:\n%s", c)
 	}
 }
