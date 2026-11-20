@@ -1,0 +1,9 @@
+/bin/
+/dist/
+# local development against an unpublished db-branch (see README)
+go.work
+go.work.sum
+/packaging/manifest.json
+/packaging/manifest.json.sig
+/packaging/runtimes.json
+/db-branch-rt-clickhouse

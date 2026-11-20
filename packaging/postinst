@@ -1,0 +1,6 @@
+#!/bin/sh
+# The module and the ClickHouse it runs have their own OS user (db-branch-rt-<engine>).
+set -e
+if ! getent passwd db-branch-rt-clickhouse >/dev/null; then
+  adduser --system --group --no-create-home --home /nonexistent --shell /usr/sbin/nologin db-branch-rt-clickhouse
+fi
