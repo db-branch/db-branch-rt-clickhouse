@@ -29,7 +29,12 @@ type module struct {
 	http *http.Client
 }
 
-func newModule() *module { return &module{http: &http.Client{Timeout: 5 * time.Minute}} }
+// newModule's HTTP client does not keep connections: ClickHouse waits for the
+// connections left open when it is told to stop (5 seconds, then it ends without
+// its clean shutdown), and the module would be the one holding them.
+func newModule() *module {
+	return &module{http: &http.Client{Timeout: 5 * time.Minute, Transport: &http.Transport{DisableKeepAlives: true}}}
+}
 
 func internal(err error) error { return status.Error(codes.Internal, err.Error()) }
 func ok() (*pb.Empty, error)   { return &pb.Empty{}, nil }
@@ -43,14 +48,31 @@ func (m *module) Describe(context.Context, *pb.DescribeRequest) (*pb.EngineSpec,
 	}, nil
 }
 
-// Catalog: the prototype lists no downloads; the runtime is put in the
-// runtime directory by hand (a pinned archive would be listed here).
+// releases are the builds db-branch may download: ClickHouse's own LTS archives
+// ("common-static" holds the clickhouse binary), pinned by SHA-256. To add a
+// release, download it, check ClickHouse's published .sha512, and add the SHA-256.
+var releases = []*pb.CatalogEntry{
+	{Version: "26.3.19.3", Platform: "amd64", Size: 223623706,
+		Url:    "https://packages.clickhouse.com/tgz/lts/clickhouse-common-static-26.3.19.3-amd64.tgz",
+		Sha256: "8c9886db49555efb6bef2ee08656af0d48bd07c83a08a729abb9d60e26bfff3d"},
+}
+
 func (m *module) Catalog(context.Context, *pb.CatalogRequest) (*pb.CatalogResponse, error) {
-	return &pb.CatalogResponse{}, nil
+	return &pb.CatalogResponse{Entries: releases}, nil
+}
+
+// binary is the clickhouse executable of an unpacked runtime: usr/bin/clickhouse
+// in ClickHouse's archive, or a clickhouse placed by hand in the directory.
+func binary(runtimeDir string) string {
+	packaged := filepath.Join(runtimeDir, "usr", "bin", "clickhouse")
+	if _, err := os.Stat(packaged); err == nil {
+		return packaged
+	}
+	return filepath.Join(runtimeDir, "clickhouse")
 }
 
 func (m *module) PrepareRuntime(ctx context.Context, r *pb.PrepareRuntimeRequest) (*pb.Empty, error) {
-	bin := filepath.Join(r.StagingDir, "clickhouse")
+	bin := binary(r.StagingDir)
 	if out, err := exec.CommandContext(ctx, bin, "--version").CombinedOutput(); err != nil {
 		return nil, internal(fmt.Errorf("%s does not run: %v: %.200s", bin, err, out))
 	}
@@ -93,7 +115,7 @@ func (m *module) PrepareStart(_ context.Context, r *pb.InstanceRequest) (*pb.Lau
 		return nil, internal(err)
 	}
 	return &pb.LaunchPlan{
-		Command: filepath.Join(i.RuntimeDir, "clickhouse"), Args: []string{"server", "--config-file=" + cfg},
+		Command: binary(i.RuntimeDir), Args: []string{"server", "--config-file=" + cfg},
 		ServiceType: "simple", KillSignal: "SIGTERM", TimeoutStopSec: 120,
 		// `clickhouse server` is a watchdog and a server: a SIGTERM to both makes the
 		// server take the second one for "stop now" and skip its clean shutdown.

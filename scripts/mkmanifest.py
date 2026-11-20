@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""manifest.json (and runtimes.json) of the ClickHouse module. usage: mkmodule_ch.py <module dir>"""
+"""manifest.json (and runtimes.json) of the ClickHouse module. usage: mkmanifest.py <module dir>"""
 import hashlib, json, sys
 d = sys.argv[1]
 def sha(p): return hashlib.sha256(open(p, 'rb').read()).hexdigest()

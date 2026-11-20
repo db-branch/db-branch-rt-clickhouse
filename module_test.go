@@ -235,3 +235,74 @@ func TestAdminAccessとFormatDSNとTailLogとRemove(t *testing.T) {
 		t.Fatal("log must be removed")
 	}
 }
+
+func TestCatalog_固定したLTSのtgzをURLとダイジェストつきで返す(t *testing.T) {
+	r, err := newModule().Catalog(context.Background(), &pb.CatalogRequest{})
+	if err != nil || len(r.Entries) == 0 {
+		t.Fatalf("%v %v", r, err)
+	}
+	for _, e := range r.Entries {
+		if !strings.HasPrefix(e.Url, "https://packages.clickhouse.com/tgz/lts/clickhouse-common-static-"+e.Version+"-") ||
+			len(e.Sha256) != 64 || e.Size <= 0 || (e.Platform != "amd64" && e.Platform != "arm64") ||
+			!strings.HasSuffix(e.Url, "-"+e.Platform+".tgz") {
+			t.Errorf("entry %+v", e)
+		}
+	}
+}
+
+func TestPrepareStart_展開したtgzのusr_bin_clickhouseを優先する(t *testing.T) {
+	m := newModule()
+	srv := httptest.NewServer(http.NotFoundHandler())
+	defer srv.Close()
+	i := instanceFor(t, srv)
+	i.RuntimeDir = filepath.Join(t.TempDir(), "rt")
+	plain := filepath.Join(i.RuntimeDir, "clickhouse")
+	packaged := filepath.Join(i.RuntimeDir, "usr", "bin", "clickhouse")
+	if err := os.MkdirAll(filepath.Dir(packaged), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Neither exists yet: the plain name (a hand-placed binary) is the default.
+	plan, _ := m.PrepareStart(context.Background(), &pb.InstanceRequest{Instance: i})
+	if plan.Command != plain {
+		t.Fatalf("default = %s", plan.Command)
+	}
+	_ = os.WriteFile(packaged, []byte("#!/bin/sh\n"), 0o755)
+	plan, _ = m.PrepareStart(context.Background(), &pb.InstanceRequest{Instance: i})
+	if plan.Command != packaged {
+		t.Fatalf("packaged = %s", plan.Command)
+	}
+}
+
+func TestPrepareRuntime_動くバイナリだけを受け入れる(t *testing.T) {
+	m := newModule()
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "usr", "bin")
+	_ = os.MkdirAll(bin, 0o755)
+	if _, err := m.PrepareRuntime(context.Background(), &pb.PrepareRuntimeRequest{Version: "1", StagingDir: dir}); status.Code(err) != codes.Internal {
+		t.Fatalf("no binary: %v", err)
+	}
+	_ = os.WriteFile(filepath.Join(bin, "clickhouse"), []byte("#!/bin/sh\necho ClickHouse\n"), 0o755)
+	if _, err := m.PrepareRuntime(context.Background(), &pb.PrepareRuntimeRequest{Version: "1", StagingDir: dir}); err != nil {
+		t.Fatalf("a binary that runs: %v", err)
+	}
+	_ = os.WriteFile(filepath.Join(bin, "clickhouse"), []byte("#!/bin/sh\nexit 3\n"), 0o755)
+	if _, err := m.PrepareRuntime(context.Background(), &pb.PrepareRuntimeRequest{Version: "1", StagingDir: dir}); err == nil {
+		t.Fatal("a binary that fails must be refused")
+	}
+}
+
+func TestHTTP_接続を使い回さない_ClickHouseは停止時に残った接続を待つ(t *testing.T) {
+	m := newModule()
+	var closes []bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		closes = append(closes, r.Close) // the client asked for "Connection: close"
+		io.WriteString(w, "Ok.")
+	}))
+	defer srv.Close()
+	i := instanceFor(t, srv)
+	_, _ = m.Health(context.Background(), &pb.InstanceRequest{Instance: i})
+	_, _ = m.Query(context.Background(), &pb.QueryRequest{Instance: i, User: "app", Sql: "SELECT 1"})
+	if len(closes) != 2 || !closes[0] || !closes[1] {
+		t.Fatalf("keep-alive connections would hold ClickHouse's shutdown for seconds: %v", closes)
+	}
+}
