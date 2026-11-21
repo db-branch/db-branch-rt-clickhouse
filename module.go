@@ -31,6 +31,9 @@ const (
 	defaultFreezeTimeout      = 5 * time.Second
 	defaultFreezePollInterval = 50 * time.Millisecond
 	unfreezeRollbackTimeout   = 5 * time.Second
+
+	defaultDumpConnectTimeout = 30 * time.Second
+	defaultDumpIdleTimeout    = 2 * time.Minute
 )
 
 type module struct {
@@ -38,6 +41,11 @@ type module struct {
 	http               *http.Client
 	freezeTimeout      time.Duration
 	freezePollInterval time.Duration
+	maxDumpBytes       int64
+	maxDumpTables      int
+	dumpChunkSize      int
+	dumpConnectTimeout time.Duration
+	dumpIdleTimeout    time.Duration
 }
 
 // newModule's HTTP client does not keep connections: ClickHouse waits for the
@@ -48,6 +56,11 @@ func newModule() *module {
 		http:               &http.Client{Timeout: 5 * time.Minute, Transport: &http.Transport{DisableKeepAlives: true}},
 		freezeTimeout:      defaultFreezeTimeout,
 		freezePollInterval: defaultFreezePollInterval,
+		maxDumpBytes:       defaultMaxDumpBytes,
+		maxDumpTables:      defaultMaxDumpTables,
+		dumpChunkSize:      defaultDumpChunkSize,
+		dumpConnectTimeout: defaultDumpConnectTimeout,
+		dumpIdleTimeout:    defaultDumpIdleTimeout,
 	}
 }
 
@@ -59,7 +72,7 @@ func (m *module) Describe(context.Context, *pb.DescribeRequest) (*pb.EngineSpec,
 		Engine: "clickhouse", DisplayName: "ClickHouse", RunAsUser: osUser, VersionPattern: `^[0-9]+\.[0-9]+(\.[0-9]+)*$`,
 		ZfsProps:     map[string]string{"recordsize": "128K", "compression": "lz4"},
 		Protocols:    []*pb.ProtocolPort{{Name: "http", Primary: true}},
-		Capabilities: &pb.Capabilities{Query: true, Checkpoints: true, LiveFreeze: true, Upgrade: true},
+		Capabilities: &pb.Capabilities{Query: true, Checkpoints: true, LiveFreeze: true, Upgrade: true, SourceDump: true},
 	}, nil
 }
 
@@ -520,6 +533,458 @@ func (m *module) StartUpgraded(ctx context.Context, r *pb.StartUpgradedRequest) 
 			Message: msg,
 		}},
 	}, nil
+}
+
+type idleTimeoutConn struct {
+	net.Conn
+	timeout time.Duration
+}
+
+func (c *idleTimeoutConn) Read(p []byte) (int, error) {
+	if c.timeout > 0 {
+		_ = c.Conn.SetReadDeadline(time.Now().Add(c.timeout))
+	}
+	return c.Conn.Read(p)
+}
+
+func (c *idleTimeoutConn) Write(p []byte) (int, error) {
+	if c.timeout > 0 {
+		_ = c.Conn.SetWriteDeadline(time.Now().Add(c.timeout))
+	}
+	return c.Conn.Write(p)
+}
+
+func (m *module) streamHTTPClient() (*http.Client, func()) {
+	connTimeout := m.dumpConnectTimeout
+	if connTimeout <= 0 {
+		connTimeout = defaultDumpConnectTimeout
+	}
+	idleTimeout := m.dumpIdleTimeout
+	if idleTimeout <= 0 {
+		idleTimeout = defaultDumpIdleTimeout
+	}
+	dialer := &net.Dialer{Timeout: connTimeout}
+	tr := &http.Transport{
+		DisableKeepAlives:     true,
+		ResponseHeaderTimeout: idleTimeout,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := dialer.DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			return &idleTimeoutConn{Conn: conn, timeout: idleTimeout}, nil
+		},
+	}
+	client := &http.Client{
+		Transport: tr,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return errors.New("HTTP redirects are not allowed")
+		},
+	}
+	return client, tr.CloseIdleConnections
+}
+
+func validateSourceHost(host string) error {
+	if host == "" {
+		return errors.New("source host is required")
+	}
+	for i := 0; i < len(host); i++ {
+		c := host[i]
+		if c <= 0x20 || c == 0x7f || c == '/' || c == '?' || c == '#' || c == '@' {
+			return fmt.Errorf("source host %q is invalid", host)
+		}
+	}
+	return nil
+}
+
+func (m *module) sourceQuery(ctx context.Context, client *http.Client, base, user, password, sql string) (*pb.QueryResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/?default_format=JSONCompact", strings.NewReader(sql))
+	if err != nil {
+		return nil, internal(errors.New(scrubSecret(err.Error(), password)))
+	}
+	req.SetBasicAuth(user, password)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, status.Error(codes.Unavailable, scrubSecret(err.Error(), password))
+	}
+	defer resp.Body.Close()
+	body, rerr := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	if rerr != nil {
+		return nil, status.Error(codes.Unavailable, scrubSecret(rerr.Error(), password))
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, status.Error(codes.Internal, scrubSecret(shortClickHouseError(body), password))
+	}
+	res, err := parseResult(body, 0)
+	if err != nil {
+		return nil, internal(errors.New(scrubSecret(err.Error(), password)))
+	}
+	return res, nil
+}
+
+type inspectedTable struct {
+	meta dumpTableMeta
+	ddl  string
+}
+
+// DumpSource dumps the requested databases from a source ClickHouse server
+// over HTTP (read-only queries only) into a 0600 custom framed file at outPath.
+// On any error, no partial file is left behind.
+func (m *module) DumpSource(ctx context.Context, r *pb.DumpSourceRequest) (*pb.Empty, error) {
+	src := r.GetSource()
+	outPath := r.GetOutPath()
+	if src == nil || outPath == "" {
+		return nil, status.Error(codes.InvalidArgument, "source and out_path are required")
+	}
+	if err := validateSourceHost(src.Host); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	if src.Port < 1 || src.Port > 65535 {
+		return nil, status.Errorf(codes.InvalidArgument, "source port %d is out of range", src.Port)
+	}
+	if len(src.Databases) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "at least one source database is required")
+	}
+	seenDB := make(map[string]bool, len(src.Databases))
+	databases := make([]string, 0, len(src.Databases))
+	quotedList := make([]string, 0, len(src.Databases))
+	for _, db := range src.Databases {
+		if err := validateIdent(db); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid database %q: %v", db, err)
+		}
+		if isForbiddenDatabase(db) {
+			return nil, status.Errorf(codes.InvalidArgument, "database %q cannot be dumped", db)
+		}
+		if seenDB[db] {
+			return nil, status.Errorf(codes.InvalidArgument, "database %q is listed twice", db)
+		}
+		seenDB[db] = true
+		databases = append(databases, db)
+		quotedList = append(quotedList, quoteSQLString(db))
+	}
+
+	client, closeIdle := m.streamHTTPClient()
+	defer closeIdle()
+	srcBase := "http://" + net.JoinHostPort(src.Host, strconv.Itoa(int(src.Port)))
+
+	// 1. Source ClickHouse version (read-only).
+	verRes, err := m.sourceQuery(ctx, client, srcBase, src.User, src.Password, "SELECT version()")
+	if err != nil {
+		return nil, err
+	}
+	chVersion := ""
+	if len(verRes.Rows) > 0 && len(verRes.Rows[0].Cells) > 0 && !verRes.Rows[0].Cells[0].IsNull {
+		chVersion = strings.TrimSpace(verRes.Rows[0].Cells[0].Value)
+	}
+
+	// 2. Verify all requested databases exist and use safe local database engines.
+	inClause := strings.Join(quotedList, ", ")
+	dbRes, err := m.sourceQuery(ctx, client, srcBase, src.User, src.Password,
+		"SELECT name, engine FROM system.databases WHERE name IN ("+inClause+")")
+	if err != nil {
+		return nil, err
+	}
+	foundDBs := make(map[string]string, len(dbRes.Rows))
+	for _, row := range dbRes.Rows {
+		if len(row.Cells) >= 2 && !row.Cells[0].IsNull && !row.Cells[1].IsNull {
+			foundDBs[row.Cells[0].Value] = row.Cells[1].Value
+		}
+	}
+	var missingDBs, unsafeDBs []string
+	for _, db := range databases {
+		eng, ok := foundDBs[db]
+		if !ok {
+			missingDBs = append(missingDBs, db)
+			continue
+		}
+		if !isAllowedDatabaseEngine(eng) {
+			unsafeDBs = append(unsafeDBs, fmt.Sprintf("%s (engine=%s)", db, eng))
+		}
+	}
+	if len(missingDBs) > 0 {
+		return nil, status.Errorf(codes.NotFound, "source database(s) not found: %s", strings.Join(missingDBs, ", "))
+	}
+	if len(unsafeDBs) > 0 {
+		return nil, status.Errorf(codes.FailedPrecondition, "unsupported source database engine(s): %s", strings.Join(unsafeDBs, ", "))
+	}
+
+	// 3. List all tables in the requested databases (excluding temp & hidden .inner* tables).
+	tblRes, err := m.sourceQuery(ctx, client, srcBase, src.User, src.Password,
+		"SELECT database, name, engine FROM system.tables WHERE database IN ("+inClause+") AND is_temporary = 0 AND name NOT LIKE '.inner%' ORDER BY database, name")
+	if err != nil {
+		return nil, err
+	}
+	maxTables := m.maxDumpTables
+	if maxTables <= 0 {
+		maxTables = defaultMaxDumpTables
+	}
+	if len(tblRes.Rows) > maxTables {
+		return nil, status.Errorf(codes.ResourceExhausted, "source has %d tables, exceeding limit of %d", len(tblRes.Rows), maxTables)
+	}
+
+	// 4. Inspect EVERY table's engine and DDL before creating the dump file.
+	var baseTables, mvTables, viewTables []inspectedTable
+	var rejected []string
+	for _, row := range tblRes.Rows {
+		if len(row.Cells) < 3 || row.Cells[0].IsNull || row.Cells[1].IsNull || row.Cells[2].IsNull {
+			return nil, status.Error(codes.Internal, "unexpected system.tables row shape")
+		}
+		db, name, eng := row.Cells[0].Value, row.Cells[1].Value, row.Cells[2].Value
+		if !seenDB[db] {
+			return nil, status.Errorf(codes.Internal, "source returned unexpected database %q", db)
+		}
+		qdb := "`" + db + "`" // already validated in seenDB
+		qt, err := quoteIdent(name)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid table name %q.%q: %v", db, name, err)
+		}
+		if !isAllowedTableEngine(eng) {
+			rejected = append(rejected, fmt.Sprintf("%s.%s (engine=%s)", db, name, eng))
+			continue
+		}
+		ddlRes, err := m.sourceQuery(ctx, client, srcBase, src.User, src.Password, "SHOW CREATE TABLE "+qdb+"."+qt)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "SHOW CREATE TABLE %s.%s: %s", db, name, scrubSecret(err.Error(), src.Password))
+		}
+		if len(ddlRes.Rows) == 0 || len(ddlRes.Rows[0].Cells) == 0 || ddlRes.Rows[0].Cells[0].IsNull {
+			return nil, status.Errorf(codes.Internal, "SHOW CREATE TABLE %s.%s returned empty result", db, name)
+		}
+		ddl := strings.TrimSpace(ddlRes.Rows[0].Cells[0].Value)
+		if err := validateTableDDL(db, name, eng, ddl); err != nil {
+			rejected = append(rejected, fmt.Sprintf("%s.%s (engine=%s: %v)", db, name, eng, err))
+			continue
+		}
+		item := inspectedTable{
+			meta: dumpTableMeta{Database: db, Name: name, Engine: eng, HasData: tableHasData(eng, ddl)},
+			ddl:  ddl,
+		}
+		switch eng {
+		case "MaterializedView":
+			mvTables = append(mvTables, item)
+		case "View":
+			viewTables = append(viewTables, item)
+		default:
+			baseTables = append(baseTables, item)
+		}
+	}
+	if len(rejected) > 0 {
+		return nil, status.Errorf(codes.FailedPrecondition, "unsupported tables in source dump: %s", strings.Join(rejected, "; "))
+	}
+
+	ordered := make([]inspectedTable, 0, len(baseTables)+len(mvTables)+len(viewTables))
+	ordered = append(ordered, baseTables...)
+	ordered = append(ordered, mvTables...)
+	ordered = append(ordered, viewTables...)
+
+	metas := make([]dumpTableMeta, len(ordered))
+	for idx, it := range ordered {
+		metas[idx] = it.meta
+	}
+
+	// 5. Write header, DDLs, and streamed Native data blocks to a 0600 file.
+	f, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return nil, internal(err)
+	}
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		_ = os.Remove(outPath)
+		return nil, internal(err)
+	}
+	cleanupFile := func() {
+		_ = f.Truncate(0)
+		_ = f.Close()
+		_ = os.Remove(outPath)
+	}
+
+	maxBytes := m.maxDumpBytes
+	if maxBytes <= 0 {
+		maxBytes = defaultMaxDumpBytes
+	}
+	dw := newDumpWriter(f, maxBytes)
+	hdr := dumpHeader{
+		Format:            dumpFormatMagic,
+		Version:           dumpFormatVersion,
+		ClickHouseVersion: chVersion,
+		CreatedAt:         time.Now().UTC().Format(time.RFC3339),
+		Databases:         databases,
+		Tables:            metas,
+	}
+	if err := dw.WriteHeader(hdr); err != nil {
+		cleanupFile()
+		return nil, dumpWriteError(err, src.Password)
+	}
+
+	for _, it := range ordered {
+		if !it.meta.HasData {
+			if err := dw.WriteTable(it.meta, it.ddl, nil, m.dumpChunkSize); err != nil {
+				cleanupFile()
+				return nil, dumpWriteError(err, src.Password)
+			}
+			continue
+		}
+		qdb, _ := quoteIdent(it.meta.Database)
+		qt, _ := quoteIdent(it.meta.Name)
+		sql := "SELECT * FROM " + qdb + "." + qt + " FORMAT Native"
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, srcBase+"/", strings.NewReader(sql))
+		if err != nil {
+			cleanupFile()
+			return nil, internal(errors.New(scrubSecret(err.Error(), src.Password)))
+		}
+		req.SetBasicAuth(src.User, src.Password)
+		resp, err := client.Do(req)
+		if err != nil {
+			cleanupFile()
+			return nil, status.Errorf(codes.Unavailable, "dump table %s.%s: %s", it.meta.Database, it.meta.Name, scrubSecret(err.Error(), src.Password))
+		}
+		if resp.StatusCode != http.StatusOK {
+			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+			_ = resp.Body.Close()
+			cleanupFile()
+			return nil, status.Errorf(codes.Internal, "dump table %s.%s: %s", it.meta.Database, it.meta.Name, scrubSecret(shortClickHouseError(errBody), src.Password))
+		}
+		werr := dw.WriteTable(it.meta, it.ddl, resp.Body, m.dumpChunkSize)
+		_ = resp.Body.Close()
+		if werr != nil {
+			cleanupFile()
+			return nil, dumpWriteError(fmt.Errorf("dump table %s.%s: %w", it.meta.Database, it.meta.Name, werr), src.Password)
+		}
+	}
+
+	if err := dw.Flush(); err != nil {
+		cleanupFile()
+		return nil, dumpWriteError(err, src.Password)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(outPath)
+		return nil, internal(err)
+	}
+	return ok()
+}
+
+func dumpWriteError(err error, password string) error {
+	msg := scrubSecret(err.Error(), password)
+	if errors.Is(err, errDumpSizeLimitExceeded) {
+		return status.Error(codes.ResourceExhausted, msg)
+	}
+	return status.Error(codes.Internal, msg)
+}
+
+func (m *module) execAdminStream(ctx context.Context, client *http.Client, targetBase, sql string, body io.Reader) error {
+	var req *http.Request
+	var err error
+	if body != nil {
+		req, err = http.NewRequestWithContext(ctx, http.MethodPost, targetBase+"/?query="+url.QueryEscape(sql), body)
+	} else {
+		req, err = http.NewRequestWithContext(ctx, http.MethodPost, targetBase+"/", strings.NewReader(sql))
+	}
+	if err != nil {
+		return internal(err)
+	}
+	req.SetBasicAuth("admin", "")
+	resp, err := client.Do(req)
+	if err != nil {
+		return status.Error(codes.Unavailable, err.Error())
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		return errors.New(shortClickHouseError(errBody))
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return nil
+}
+
+// Load restores a custom framed dump written by DumpSource into a running
+// ClickHouse instance using the local admin account. Every DDL is re-validated
+// before execution to defend against tampered dump files.
+func (m *module) Load(ctx context.Context, r *pb.LoadRequest) (*pb.Empty, error) {
+	i := r.GetInstance()
+	dumpPath := r.GetDumpPath()
+	if i == nil || i.Ports["http"] == 0 || dumpPath == "" {
+		return nil, status.Error(codes.InvalidArgument, "instance (with http port) and dump_path are required")
+	}
+	f, err := os.Open(dumpPath)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "open dump %s: %v", dumpPath, err)
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil || !fi.Mode().IsRegular() {
+		return nil, status.Errorf(codes.InvalidArgument, "dump path %s is not a regular file", dumpPath)
+	}
+
+	dr := newDumpReader(f, m.maxDumpTables)
+	hdr, err := dr.ReadHeader()
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid dump file: %v", err)
+	}
+
+	client, closeIdle := m.streamHTTPClient()
+	defer closeIdle()
+	targetBase := "http://" + net.JoinHostPort(adminHost(i), strconv.Itoa(int(i.Ports["http"])))
+
+	for _, db := range hdr.Databases {
+		qdb := "`" + db + "`" // validated by ReadHeader
+		if db != "default" {
+			if err := m.execAdminStream(ctx, client, targetBase, "DROP DATABASE IF EXISTS "+qdb+" SYNC", nil); err != nil {
+				return nil, status.Errorf(codes.Internal, "load database %s (DROP DATABASE): %v", db, err)
+			}
+		}
+		if err := m.execAdminStream(ctx, client, targetBase, "CREATE DATABASE IF NOT EXISTS "+qdb, nil); err != nil {
+			return nil, status.Errorf(codes.Internal, "load database %s (CREATE DATABASE): %v", db, err)
+		}
+	}
+
+	for range hdr.Tables {
+		meta, ddl, data, err := dr.NextTable()
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "corrupt dump: %v", err)
+		}
+		if err := validateTableDDL(meta.Database, meta.Name, meta.Engine, ddl); err != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "rejected DDL for %s.%s (engine=%s): %v", meta.Database, meta.Name, meta.Engine, err)
+		}
+		qdb, _ := quoteIdent(meta.Database)
+		qt, _ := quoteIdent(meta.Name)
+
+		if meta.Database == "default" {
+			dropStmt := "DROP TABLE IF EXISTS " + qdb + "." + qt
+			if meta.Engine == "View" || meta.Engine == "MaterializedView" {
+				dropStmt = "DROP VIEW IF EXISTS " + qdb + "." + qt
+			}
+			if err := m.execAdminStream(ctx, client, targetBase, dropStmt, nil); err != nil {
+				return nil, status.Errorf(codes.Internal, "load table %s.%s (DROP): %v", meta.Database, meta.Name, err)
+			}
+		}
+		if err := m.execAdminStream(ctx, client, targetBase, ddl, nil); err != nil {
+			return nil, status.Errorf(codes.Internal, "load table %s.%s (DDL): %v", meta.Database, meta.Name, err)
+		}
+		if !meta.HasData {
+			continue
+		}
+		hasBytes, err := data.HasData()
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "load table %s.%s (data): %v", meta.Database, meta.Name, err)
+		}
+		if !hasBytes {
+			continue
+		}
+		insertSQL := "INSERT INTO " + qdb + "." + qt + " FORMAT Native"
+		if err := m.execAdminStream(ctx, client, targetBase, insertSQL, data); err != nil {
+			return nil, status.Errorf(codes.Internal, "load table %s.%s (data): %v", meta.Database, meta.Name, err)
+		}
+		if derr := data.Err(); derr != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "load table %s.%s (data): %v", meta.Database, meta.Name, derr)
+		}
+		if !data.Done() {
+			return nil, status.Errorf(codes.InvalidArgument, "load table %s.%s (data): stream ended before terminator", meta.Database, meta.Name)
+		}
+	}
+
+	if err := dr.VerifyEOF(); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "corrupt dump: %v", err)
+	}
+	return ok()
 }
 
 func readLogins(stateDir string) (map[string]string, error) {

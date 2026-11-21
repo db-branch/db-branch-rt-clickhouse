@@ -19,11 +19,16 @@ ClickHouse** (systemd unit `db-branch-rt@<instance>.service`), so the module nev
 |---|---|
 | engine | `clickhouse` |
 | protocol | `http` (primary) |
-| features | `query`, `checkpoints` |
+| features | `query`, `checkpoints`, `live_freeze`, `upgrade`, `source_dump` |
 | OS user | `db-branch-rt-clickhouse` |
 | module files | `/usr/lib/db-branch/runtimes/clickhouse/` |
 | runtime | `/var/lib/db-branch/runtimes/clickhouse/<version>/clickhouse` |
 | stop | `KillMode=mixed`: `clickhouse server` is a watchdog and a server, and a SIGTERM to both makes the server skip its clean shutdown |
+
+### Source dump (`DumpSource` / `Load`) limitations
+
+- **Plaintext HTTP only**: Because `RefreshSource` currently carries no TLS settings, `DumpSource` connects to the source ClickHouse server over plaintext HTTP (Basic Auth, no redirects). Use it only over a closed network such as a VPN or private VPC.
+- **Supported engines only**: Only local ClickHouse table engines (`MergeTree` family, `Log` family, `Memory`, `Null`, `View`, `MaterializedView`) are supported. Databases containing external-resource engines (`URL`, `S3`, `HDFS`, `File`, `MySQL`, `PostgreSQL`, `MongoDB`, `Kafka`, `RabbitMQ`, `JDBC`, `ODBC`, `Redis`, `Distributed`, `Executable`, `Dictionary`, etc.) or DDLs invoking external table functions abort the dump with a list of offending tables. System databases (`system`, `INFORMATION_SCHEMA`, `information_schema`) are always refused.
 
 ## Layout
 
@@ -31,6 +36,7 @@ ClickHouse** (systemd unit `db-branch-rt@<instance>.service`), so the module nev
 main.go         runtimeplugin.Serve
 module.go       the Runtime gRPC service
 pure.go         config.xml, users.xml, result parsing (no I/O)
+dump.go         framed dump reader/writer, identifier and DDL/engine safety checks
 *_test.go       unit tests; integration_test.go (tag integration) runs a real ClickHouse
 scripts/        mkmanifest.py (manifest.json with the digests), sign-manifest.sh, release-asset.sh, conformance.sh
 packaging/      nfpm.yaml, postinst

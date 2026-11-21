@@ -70,6 +70,7 @@ def main():
             "checkpoints": True,
             "live_freeze": True,
             "upgrade": True,
+            "source_dump": True,
         },
         "systemd": {
             "service_type": "simple",

@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -54,7 +56,7 @@ func TestDescribe_ClickHouseの宣言(t *testing.T) {
 	d, _ := newModule().Describe(context.Background(), nil)
 	if d.Engine != "clickhouse" || d.RunAsUser != "db-branch-rt-clickhouse" || len(d.Protocols) != 1 || !d.Protocols[0].Primary ||
 		!d.Capabilities.Query || !d.Capabilities.Checkpoints || !d.Capabilities.LiveFreeze || !d.Capabilities.Upgrade ||
-		d.Capabilities.SourceDump || d.Capabilities.BranchMerge || d.Capabilities.HistoryRecord ||
+		!d.Capabilities.SourceDump || d.Capabilities.BranchMerge || d.Capabilities.HistoryRecord ||
 		d.Capabilities.UpdateStats || d.Capabilities.InstanceMetrics || d.ZfsProps["recordsize"] != "128K" {
 		t.Fatalf("%+v", d)
 	}
@@ -867,5 +869,712 @@ func TestStartUpgraded_新しい版のランタイムでPrepareStartと同じ設
 	iBad.Ports = nil
 	if _, err := m.StartUpgraded(context.Background(), &pb.StartUpgradedRequest{Instance: iBad}); status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("no port: %v", err)
+	}
+}
+
+func hostPortOf(t *testing.T, srv *httptest.Server) (string, int32) {
+	t.Helper()
+	h, p, err := net.SplitHostPort(strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pn, err := strconv.Atoi(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return h, int32(pn)
+}
+
+func jsonCompact(cols []string, rows [][]any) string {
+	meta := make([]map[string]string, len(cols))
+	for i, c := range cols {
+		meta[i] = map[string]string{"name": c}
+	}
+	b, _ := json.Marshal(map[string]any{"meta": meta, "data": rows, "rows": len(rows)})
+	return string(b)
+}
+
+func TestDumpSourceとLoad_ソースから読み取り専用で0600ダンプを書き出し別インスタンスへ復元できる(t *testing.T) {
+	m := newModule()
+	m.dumpChunkSize = 1024
+
+	eventsNative := bytes.Repeat([]byte{0x00, 0x01, 0x7f, 0xfe, 'A', 'B'}, 1500)
+	notesNative := []byte("native-notes-payload-\x00\xff")
+	mvInnerNative := []byte("native-mv-inner-payload")
+
+	ddls := map[string]string{
+		"`app`.`events`":     "CREATE TABLE app.events (`id` UInt64, `url` String) ENGINE = MergeTree ORDER BY id",
+		"`app`.`mem`":        "CREATE TABLE app.mem (`k` String) ENGINE = Memory",
+		"`app`.`v_events`":   "CREATE VIEW app.v_events AS SELECT id, url FROM app.events",
+		"`app`.`mv_to`":      "CREATE MATERIALIZED VIEW app.mv_to TO app.mem (`k` String) AS SELECT url AS k FROM app.events",
+		"`app`.`mv_inner`":   "CREATE MATERIALIZED VIEW app.mv_inner (`id` UInt64) ENGINE = MergeTree ORDER BY id AS SELECT id FROM app.events",
+		"`default`.`notes`":  "CREATE TABLE default.notes (`body` String) ENGINE = TinyLog",
+		"`default`.`v_note`": "CREATE VIEW default.v_note AS SELECT body FROM default.notes",
+	}
+
+	var srcSQLs []string
+	srcSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		u, p, ok := r.BasicAuth()
+		if !ok || u != "srcuser" || p != "srcsecret" {
+			w.WriteHeader(http.StatusUnauthorized)
+			io.WriteString(w, "Code: 516. Authentication failed")
+			return
+		}
+		b, _ := io.ReadAll(r.Body)
+		sql := strings.TrimSpace(string(b))
+		srcSQLs = append(srcSQLs, sql)
+		upper := strings.ToUpper(sql)
+		if !strings.HasPrefix(upper, "SELECT ") && !strings.HasPrefix(upper, "SHOW CREATE TABLE ") {
+			t.Errorf("DumpSource must only send read-only SQL, got: %s", sql)
+		}
+		switch {
+		case sql == "SELECT version()":
+			io.WriteString(w, jsonCompact([]string{"version()"}, [][]any{{"26.3.19.3"}}))
+		case strings.Contains(sql, "FROM system.databases"):
+			io.WriteString(w, jsonCompact([]string{"name", "engine"}, [][]any{{"app", "Atomic"}, {"default", "Atomic"}}))
+		case strings.Contains(sql, "FROM system.tables"):
+			io.WriteString(w, jsonCompact([]string{"database", "name", "engine"}, [][]any{
+				{"app", "events", "MergeTree"},
+				{"app", "mem", "Memory"},
+				{"app", "mv_inner", "MaterializedView"},
+				{"app", "mv_to", "MaterializedView"},
+				{"app", "v_events", "View"},
+				{"default", "notes", "TinyLog"},
+				{"default", "v_note", "View"},
+			}))
+		case strings.HasPrefix(sql, "SHOW CREATE TABLE "):
+			target := strings.TrimPrefix(sql, "SHOW CREATE TABLE ")
+			ddl, ok := ddls[target]
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				io.WriteString(w, "Code: 60. Unknown table "+target)
+				return
+			}
+			io.WriteString(w, jsonCompact([]string{"statement"}, [][]any{{ddl}}))
+		case sql == "SELECT * FROM `app`.`events` FORMAT Native":
+			_, _ = w.Write(eventsNative)
+		case sql == "SELECT * FROM `app`.`mem` FORMAT Native":
+			// empty table: 0 bytes
+		case sql == "SELECT * FROM `default`.`notes` FORMAT Native":
+			_, _ = w.Write(notesNative)
+		case sql == "SELECT * FROM `app`.`mv_inner` FORMAT Native":
+			_, _ = w.Write(mvInnerNative)
+		default:
+			t.Errorf("unexpected source SQL: %s", sql)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer srcSrv.Close()
+
+	srcHost, srcPort := hostPortOf(t, srcSrv)
+	dumpPath := filepath.Join(t.TempDir(), "dump.chb")
+	_, err := m.DumpSource(context.Background(), &pb.DumpSourceRequest{
+		Source: &pb.RefreshSource{
+			Host: srcHost, Port: srcPort, User: "srcuser", Password: "srcsecret",
+			Databases: []string{"app", "default"},
+		},
+		OutPath: dumpPath,
+	})
+	if err != nil {
+		t.Fatalf("DumpSource: %v", err)
+	}
+
+	fi, err := os.Stat(dumpPath)
+	if err != nil {
+		t.Fatalf("stat dump: %v", err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Fatalf("dump file mode = %04o, want 0600", fi.Mode().Perm())
+	}
+
+	// Load into a mock target ClickHouse instance.
+	var dstExecs []string
+	inserts := map[string][]byte{}
+	dstSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		u, p, ok := r.BasicAuth()
+		if !ok || u != "admin" || p != "" {
+			t.Errorf("Load must authenticate as admin, got %q/%q (ok=%v)", u, p, ok)
+		}
+		if q := r.URL.Query().Get("query"); q != "" {
+			body, _ := io.ReadAll(r.Body)
+			dstExecs = append(dstExecs, q)
+			inserts[q] = body
+			return
+		}
+		b, _ := io.ReadAll(r.Body)
+		dstExecs = append(dstExecs, strings.TrimSpace(string(b)))
+	}))
+	defer dstSrv.Close()
+
+	dstInst := instanceFor(t, dstSrv)
+	if _, err := m.Load(context.Background(), &pb.LoadRequest{Instance: dstInst, DumpPath: dumpPath}); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	// Verify DB setup: non-default dropped & recreated; default created without dropping DB.
+	joined := strings.Join(dstExecs, "\n")
+	if !strings.Contains(joined, "DROP DATABASE IF EXISTS `app` SYNC") ||
+		!strings.Contains(joined, "CREATE DATABASE IF NOT EXISTS `app`") ||
+		strings.Contains(joined, "DROP DATABASE IF EXISTS `default`") ||
+		!strings.Contains(joined, "CREATE DATABASE IF NOT EXISTS `default`") ||
+		!strings.Contains(joined, "DROP TABLE IF EXISTS `default`.`notes`") ||
+		!strings.Contains(joined, "DROP VIEW IF EXISTS `default`.`v_note`") {
+		t.Fatalf("unexpected target statements:\n%s", joined)
+	}
+
+	// Verify base table data was inserted BEFORE views and materialized views were created.
+	idxEventsInsert := strings.Index(joined, "INSERT INTO `app`.`events` FORMAT Native")
+	idxMVCreate := strings.Index(joined, "CREATE MATERIALIZED VIEW app.mv_to")
+	idxViewCreate := strings.Index(joined, "CREATE VIEW app.v_events")
+	if idxEventsInsert < 0 || idxMVCreate < 0 || idxViewCreate < 0 || idxEventsInsert > idxMVCreate || idxEventsInsert > idxViewCreate {
+		t.Fatalf("base tables must be loaded before views/MVs:\n%s", joined)
+	}
+
+	// Verify Native payloads arrived byte-for-byte intact and empty/view/TO-MV tables were not inserted.
+	if !bytes.Equal(inserts["INSERT INTO `app`.`events` FORMAT Native"], eventsNative) {
+		t.Fatalf("events native payload mismatch (got %d bytes)", len(inserts["INSERT INTO `app`.`events` FORMAT Native"]))
+	}
+	if !bytes.Equal(inserts["INSERT INTO `default`.`notes` FORMAT Native"], notesNative) {
+		t.Fatalf("notes native payload mismatch")
+	}
+	if !bytes.Equal(inserts["INSERT INTO `app`.`mv_inner` FORMAT Native"], mvInnerNative) {
+		t.Fatalf("mv_inner native payload mismatch")
+	}
+	if len(inserts) != 3 {
+		t.Fatalf("expected 3 INSERTs (events, notes, mv_inner), got %d: %v", len(inserts), dstExecs)
+	}
+}
+
+func TestDumpSource_システムDBや外部エンジンや危険な関数を含むテーブルは全体をエラーで中止し部分ファイルを残さない(t *testing.T) {
+	m := newModule()
+	ctx := context.Background()
+
+	// 1. Forbidden system databases are rejected even if explicitly requested.
+	for _, sysDB := range []string{"system", "INFORMATION_SCHEMA", "information_schema", "SYSTEM"} {
+		out := filepath.Join(t.TempDir(), "out.chb")
+		_, err := m.DumpSource(ctx, &pb.DumpSourceRequest{
+			Source:  &pb.RefreshSource{Host: "127.0.0.1", Port: 8123, User: "u", Databases: []string{"app", sysDB}},
+			OutPath: out,
+		})
+		if status.Code(err) != codes.InvalidArgument {
+			t.Errorf("db %q: got %v, want InvalidArgument", sysDB, err)
+		}
+		if _, statErr := os.Stat(out); statErr == nil {
+			t.Errorf("db %q: partial file must not exist", sysDB)
+		}
+	}
+
+	// 2. Source containing external engines & dangerous functions aborts entire dump and lists ALL offending tables.
+	srcSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		sql := strings.TrimSpace(string(b))
+		switch {
+		case sql == "SELECT version()":
+			io.WriteString(w, jsonCompact([]string{"version()"}, [][]any{{"26.3.19.3"}}))
+		case strings.Contains(sql, "FROM system.databases"):
+			io.WriteString(w, jsonCompact([]string{"name", "engine"}, [][]any{{"app", "Atomic"}}))
+		case strings.Contains(sql, "FROM system.tables"):
+			io.WriteString(w, jsonCompact([]string{"database", "name", "engine"}, [][]any{
+				{"app", "ok_tbl", "MergeTree"},
+				{"app", "ext_url", "URL"},
+				{"app", "ext_s3", "S3"},
+				{"app", "ext_kafka", "Kafka"},
+				{"app", "ext_dict", "Dictionary"},
+				{"app", "v_file", "View"},
+			}))
+		case sql == "SHOW CREATE TABLE `app`.`ok_tbl`":
+			io.WriteString(w, jsonCompact([]string{"statement"}, [][]any{{"CREATE TABLE app.ok_tbl (`id` UInt64) ENGINE = MergeTree ORDER BY id"}}))
+		case sql == "SHOW CREATE TABLE `app`.`v_file`":
+			io.WriteString(w, jsonCompact([]string{"statement"}, [][]any{{"CREATE VIEW app.v_file AS SELECT * FROM FILE('/etc/passwd', 'LineAsString')"}}))
+		default:
+			t.Errorf("unexpected query after unsupported tables should have aborted: %s", sql)
+		}
+	}))
+	defer srcSrv.Close()
+
+	h, p := hostPortOf(t, srcSrv)
+	out := filepath.Join(t.TempDir(), "aborted.chb")
+	_, err := m.DumpSource(ctx, &pb.DumpSourceRequest{
+		Source:  &pb.RefreshSource{Host: h, Port: p, User: "u", Databases: []string{"app"}},
+		OutPath: out,
+	})
+	if err == nil {
+		t.Fatal("expected error for unsupported engines/functions")
+	}
+	msg := err.Error()
+	for _, want := range []string{"app.ext_url", "URL", "app.ext_s3", "S3", "app.ext_kafka", "Kafka", "app.ext_dict", "Dictionary", "app.v_file", "FILE"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error must list %q, got: %s", want, msg)
+		}
+	}
+	if _, statErr := os.Stat(out); statErr == nil {
+		t.Fatal("partial dump file must not exist on abort")
+	}
+
+	// 3. Unsafe database engine & missing database are also rejected.
+	badDBSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		sql := strings.TrimSpace(string(b))
+		switch {
+		case sql == "SELECT version()":
+			io.WriteString(w, jsonCompact([]string{"version()"}, [][]any{{"26.3.19.3"}}))
+		case strings.Contains(sql, "FROM system.databases"):
+			io.WriteString(w, jsonCompact([]string{"name", "engine"}, [][]any{{"extdb", "MySQL"}}))
+		}
+	}))
+	defer badDBSrv.Close()
+	bh, bp := hostPortOf(t, badDBSrv)
+	out2 := filepath.Join(t.TempDir(), "baddb.chb")
+	if _, err := m.DumpSource(ctx, &pb.DumpSourceRequest{
+		Source:  &pb.RefreshSource{Host: bh, Port: bp, User: "u", Databases: []string{"extdb"}},
+		OutPath: out2,
+	}); err == nil || !strings.Contains(err.Error(), "MySQL") {
+		t.Fatalf("unsafe database engine: %v", err)
+	}
+	if _, err := m.DumpSource(ctx, &pb.DumpSourceRequest{
+		Source:  &pb.RefreshSource{Host: bh, Port: bp, User: "u", Databases: []string{"missing"}},
+		OutPath: out2,
+	}); err == nil || !strings.Contains(err.Error(), "missing") {
+		t.Fatalf("missing database: %v", err)
+	}
+}
+
+func TestDumpSource_サイズ上限やテーブル数上限やリダイレクトや無通信タイムアウトを拒否しパスワードを漏らさず部分ファイルを消す(t *testing.T) {
+	ctx := context.Background()
+
+	// Conformance probe & invalid args must return InvalidArgument (not Unimplemented).
+	m := newModule()
+	for _, req := range []*pb.DumpSourceRequest{
+		{},
+		{Source: &pb.RefreshSource{}},
+		{Source: &pb.RefreshSource{Host: "127.0.0.1", Port: 8123, Databases: []string{"app"}}, OutPath: ""},
+		{Source: &pb.RefreshSource{Host: "bad host", Port: 8123, Databases: []string{"app"}}, OutPath: "/tmp/x"},
+		{Source: &pb.RefreshSource{Host: "127.0.0.1", Port: 0, Databases: []string{"app"}}, OutPath: "/tmp/x"},
+		{Source: &pb.RefreshSource{Host: "127.0.0.1", Port: 8123, Databases: []string{"app", "app"}}, OutPath: "/tmp/x"},
+		{Source: &pb.RefreshSource{Host: "127.0.0.1", Port: 8123, Databases: []string{"bad`db"}}, OutPath: "/tmp/x"},
+	} {
+		if _, err := m.DumpSource(ctx, req); status.Code(err) != codes.InvalidArgument {
+			t.Errorf("req %+v: got %v, want InvalidArgument", req, err)
+		}
+	}
+
+	// Redirect must NOT be followed.
+	redirectHit := false
+	targetSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		redirectHit = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer targetSrv.Close()
+	redirSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, targetSrv.URL, http.StatusFound)
+	}))
+	defer redirSrv.Close()
+	rh, rp := hostPortOf(t, redirSrv)
+	outRedir := filepath.Join(t.TempDir(), "redir.chb")
+	if _, err := m.DumpSource(ctx, &pb.DumpSourceRequest{
+		Source:  &pb.RefreshSource{Host: rh, Port: rp, User: "u", Password: "super-secret-password", Databases: []string{"app"}},
+		OutPath: outRedir,
+	}); err == nil {
+		t.Fatal("redirect must fail")
+	} else if strings.Contains(err.Error(), "super-secret-password") {
+		t.Fatalf("password leaked in error: %v", err)
+	}
+	if redirectHit {
+		t.Fatal("DumpSource followed an HTTP redirect")
+	}
+
+	// Password echoed by server in error body must be scrubbed.
+	echoSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		io.WriteString(w, "Code: 516. Auth failed for password=top-secret-pw-999")
+	}))
+	defer echoSrv.Close()
+	eh, ep := hostPortOf(t, echoSrv)
+	if _, err := m.DumpSource(ctx, &pb.DumpSourceRequest{
+		Source:  &pb.RefreshSource{Host: eh, Port: ep, User: "u", Password: "top-secret-pw-999", Databases: []string{"app"}},
+		OutPath: filepath.Join(t.TempDir(), "echo.chb"),
+	}); err == nil || strings.Contains(err.Error(), "top-secret-pw-999") {
+		t.Fatalf("password must be scrubbed from error: %v", err)
+	}
+
+	// Size limit and table count limit leave NO partial file behind.
+	var mode string
+	limSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		sql := strings.TrimSpace(string(b))
+		switch {
+		case sql == "SELECT version()":
+			io.WriteString(w, jsonCompact([]string{"version()"}, [][]any{{"26.3.19.3"}}))
+		case strings.Contains(sql, "FROM system.databases"):
+			io.WriteString(w, jsonCompact([]string{"name", "engine"}, [][]any{{"app", "Atomic"}}))
+		case strings.Contains(sql, "FROM system.tables"):
+			if mode == "many" {
+				io.WriteString(w, jsonCompact([]string{"database", "name", "engine"}, [][]any{
+					{"app", "t1", "Memory"},
+					{"app", "t2", "Memory"},
+					{"app", "t3", "Memory"},
+				}))
+				return
+			}
+			io.WriteString(w, jsonCompact([]string{"database", "name", "engine"}, [][]any{{"app", "big", "Memory"}}))
+		case sql == "SHOW CREATE TABLE `app`.`big`":
+			io.WriteString(w, jsonCompact([]string{"statement"}, [][]any{{"CREATE TABLE app.big (`x` String) ENGINE = Memory"}}))
+		case sql == "SELECT * FROM `app`.`big` FORMAT Native":
+			if mode == "stall" {
+				w.WriteHeader(http.StatusOK)
+				if fl, ok := w.(http.Flusher); ok {
+					fl.Flush()
+				}
+				time.Sleep(400 * time.Millisecond)
+				return
+			}
+			_, _ = w.Write(bytes.Repeat([]byte("X"), 4096))
+		}
+	}))
+	defer limSrv.Close()
+	lh, lp := hostPortOf(t, limSrv)
+
+	// Table count limit
+	mLim := newModule()
+	mLim.maxDumpTables = 2
+	mode = "many"
+	outMany := filepath.Join(t.TempDir(), "many.chb")
+	if _, err := mLim.DumpSource(ctx, &pb.DumpSourceRequest{
+		Source:  &pb.RefreshSource{Host: lh, Port: lp, User: "u", Databases: []string{"app"}},
+		OutPath: outMany,
+	}); err == nil {
+		t.Fatal("exceeding table limit must fail")
+	}
+	if _, err := os.Stat(outMany); err == nil {
+		t.Fatal("partial file left after table limit error")
+	}
+
+	// Byte size limit (even when outPath was pre-created like srcdump.Dumper does)
+	mLim.maxDumpTables = 100
+	mLim.maxDumpBytes = 512
+	mode = "size"
+	outBig := filepath.Join(t.TempDir(), "big.chb")
+	_ = os.WriteFile(outBig, nil, 0o600)
+	if _, err := mLim.DumpSource(ctx, &pb.DumpSourceRequest{
+		Source:  &pb.RefreshSource{Host: lh, Port: lp, User: "u", Databases: []string{"app"}},
+		OutPath: outBig,
+	}); err == nil {
+		t.Fatal("exceeding byte limit must fail")
+	}
+	if _, err := os.Stat(outBig); err == nil {
+		t.Fatal("partial file must be removed when byte limit is exceeded")
+	}
+
+	// Idle data timeout
+	mStall := newModule()
+	mStall.dumpIdleTimeout = 80 * time.Millisecond
+	mode = "stall"
+	outStall := filepath.Join(t.TempDir(), "stall.chb")
+	if _, err := mStall.DumpSource(ctx, &pb.DumpSourceRequest{
+		Source:  &pb.RefreshSource{Host: lh, Port: lp, User: "u", Databases: []string{"app"}},
+		OutPath: outStall,
+	}); err == nil {
+		t.Fatal("stalled stream must time out")
+	}
+	if _, err := os.Stat(outStall); err == nil {
+		t.Fatal("partial file must be removed on stream timeout")
+	}
+}
+
+func TestLoad_改ざんされたダンプや未知の版や途中エラーを安全に拒否する(t *testing.T) {
+	m := newModule()
+	ctx := context.Background()
+
+	var executed []string
+	failOn := ""
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sql := r.URL.Query().Get("query")
+		if sql == "" {
+			b, _ := io.ReadAll(r.Body)
+			sql = strings.TrimSpace(string(b))
+		} else {
+			_, _ = io.Copy(io.Discard, r.Body)
+		}
+		executed = append(executed, sql)
+		if failOn != "" && strings.Contains(sql, failOn) {
+			w.WriteHeader(http.StatusInternalServerError)
+			io.WriteString(w, "Code: 241. DB::Exception: Memory limit exceeded\nStack trace:\n0. frame\n")
+		}
+	}))
+	defer srv.Close()
+	i := instanceFor(t, srv)
+
+	// Invalid arguments
+	if _, err := m.Load(ctx, &pb.LoadRequest{}); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("empty Load: %v", err)
+	}
+	if _, err := m.Load(ctx, &pb.LoadRequest{Instance: &pb.InstanceSpec{Id: "x"}, DumpPath: "/tmp/x"}); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("no port Load: %v", err)
+	}
+	if _, err := m.Load(ctx, &pb.LoadRequest{Instance: i, DumpPath: filepath.Join(t.TempDir(), "missing.chb")}); err == nil {
+		t.Fatal("missing dump file must fail")
+	}
+
+	// Helper to write a single-table dump with an arbitrary DDL (bypassing DumpSource checks).
+	writeRawDump := func(hdr dumpHeader, ddl string, payload []byte) string {
+		p := filepath.Join(t.TempDir(), "tampered.chb")
+		f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w := newDumpWriter(f, 1<<20)
+		if err := w.WriteHeader(hdr); err != nil {
+			t.Fatal(err)
+		}
+		if len(hdr.Tables) > 0 {
+			var dr io.Reader
+			if hdr.Tables[0].HasData {
+				dr = bytes.NewReader(payload)
+			}
+			if err := w.WriteTable(hdr.Tables[0], ddl, dr, 1024); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := w.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		_ = f.Close()
+		return p
+	}
+
+	// Tampered DDLs must be rejected BEFORE sending the DDL to ClickHouse.
+	tamperedCases := []struct {
+		name string
+		hdr  dumpHeader
+		ddl  string
+	}{
+		{
+			name: "未知の版",
+			hdr:  dumpHeader{Format: dumpFormatMagic, Version: 2, Databases: []string{"app"}},
+		},
+		{
+			name: "DDLのENGINEをURLに改ざん",
+			hdr: dumpHeader{
+				Format: dumpFormatMagic, Version: 1, Databases: []string{"app"},
+				Tables: []dumpTableMeta{{Database: "app", Name: "t", Engine: "MergeTree", HasData: false}},
+			},
+			ddl: "CREATE TABLE app.t (`x` String) ENGINE = URL('http://127.0.0.1/', 'LineAsString')",
+		},
+		{
+			name: "Viewにurl関数を混入",
+			hdr: dumpHeader{
+				Format: dumpFormatMagic, Version: 1, Databases: []string{"app"},
+				Tables: []dumpTableMeta{{Database: "app", Name: "v", Engine: "View", HasData: false}},
+			},
+			ddl: "CREATE VIEW app.v AS SELECT * FROM url('http://169.254.169.254/', 'LineAsString')",
+		},
+		{
+			name: "セミコロンで2文目を注入",
+			hdr: dumpHeader{
+				Format: dumpFormatMagic, Version: 1, Databases: []string{"app"},
+				Tables: []dumpTableMeta{{Database: "app", Name: "t", Engine: "Memory", HasData: false}},
+			},
+			ddl: "CREATE TABLE app.t (`x` UInt8) ENGINE = Memory; CREATE USER evil IDENTIFIED BY 'p'",
+		},
+	}
+	for _, tc := range tamperedCases {
+		executed = nil
+		p := writeRawDump(tc.hdr, tc.ddl, nil)
+		if _, err := m.Load(ctx, &pb.LoadRequest{Instance: i, DumpPath: p}); err == nil {
+			t.Errorf("%s: expected error", tc.name)
+		}
+		for _, sql := range executed {
+			if strings.HasPrefix(sql, "CREATE TABLE") || strings.HasPrefix(sql, "CREATE VIEW") || strings.Contains(sql, "CREATE USER") {
+				t.Errorf("%s: tampered DDL must never be sent to ClickHouse: %s", tc.name, sql)
+			}
+		}
+	}
+
+	// ClickHouse error during DDL or INSERT includes table name and Code + short message (no stack trace).
+	goodHdr := dumpHeader{
+		Format: dumpFormatMagic, Version: 1, Databases: []string{"app"},
+		Tables: []dumpTableMeta{{Database: "app", Name: "events", Engine: "MergeTree", HasData: true}},
+	}
+	goodDump := writeRawDump(goodHdr, "CREATE TABLE app.events (`id` UInt64) ENGINE = MergeTree ORDER BY id", []byte("native-bytes"))
+
+	failOn = "CREATE TABLE app.events"
+	_, err := m.Load(ctx, &pb.LoadRequest{Instance: i, DumpPath: goodDump})
+	if err == nil || !strings.Contains(err.Error(), "app.events") || !strings.Contains(err.Error(), "Code: 241.") || strings.Contains(err.Error(), "Stack trace") {
+		t.Fatalf("DDL failure error = %v", err)
+	}
+
+	failOn = "INSERT INTO `app`.`events`"
+	_, err = m.Load(ctx, &pb.LoadRequest{Instance: i, DumpPath: goodDump})
+	if err == nil || !strings.Contains(err.Error(), "app.events") || !strings.Contains(err.Error(), "Code: 241.") || strings.Contains(err.Error(), "Stack trace") {
+		t.Fatalf("INSERT failure error = %v", err)
+	}
+
+	// DB-level errors (DROP DATABASE / CREATE DATABASE) and default-DB DROP TABLE error
+	failOn = "DROP DATABASE"
+	if _, err := m.Load(ctx, &pb.LoadRequest{Instance: i, DumpPath: goodDump}); err == nil || !strings.Contains(err.Error(), "DROP DATABASE") {
+		t.Fatalf("DROP DATABASE failure: %v", err)
+	}
+	failOn = "CREATE DATABASE"
+	if _, err := m.Load(ctx, &pb.LoadRequest{Instance: i, DumpPath: goodDump}); err == nil || !strings.Contains(err.Error(), "CREATE DATABASE") {
+		t.Fatalf("CREATE DATABASE failure: %v", err)
+	}
+	defHdr := dumpHeader{
+		Format: dumpFormatMagic, Version: 1, Databases: []string{"default"},
+		Tables: []dumpTableMeta{{Database: "default", Name: "t", Engine: "Memory", HasData: false}},
+	}
+	defDump := writeRawDump(defHdr, "CREATE TABLE default.t (`x` UInt8) ENGINE = Memory", nil)
+	failOn = "DROP TABLE IF EXISTS `default`.`t`"
+	if _, err := m.Load(ctx, &pb.LoadRequest{Instance: i, DumpPath: defDump}); err == nil || !strings.Contains(err.Error(), "default.t") {
+		t.Fatalf("default DROP TABLE failure: %v", err)
+	}
+	failOn = ""
+
+	// Directory path, truncated dump, trailing garbage, and server down
+	if _, err := m.Load(ctx, &pb.LoadRequest{Instance: i, DumpPath: t.TempDir()}); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("directory dump path: %v", err)
+	}
+	rawGood, _ := os.ReadFile(goodDump)
+	truncPath := filepath.Join(t.TempDir(), "trunc.chb")
+	_ = os.WriteFile(truncPath, rawGood[:len(rawGood)-5], 0o600)
+	if _, err := m.Load(ctx, &pb.LoadRequest{Instance: i, DumpPath: truncPath}); err == nil {
+		t.Fatal("truncated dump must fail Load")
+	}
+	trailPath := filepath.Join(t.TempDir(), "trail.chb")
+	_ = os.WriteFile(trailPath, append(append([]byte(nil), rawGood...), "junk"...), 0o600)
+	if _, err := m.Load(ctx, &pb.LoadRequest{Instance: i, DumpPath: trailPath}); err == nil {
+		t.Fatal("trailing garbage dump must fail Load")
+	}
+	srv.Close()
+	if _, err := m.Load(ctx, &pb.LoadRequest{Instance: i, DumpPath: goodDump}); err == nil {
+		t.Fatal("unreachable target must fail Load")
+	}
+}
+
+func TestDumpSource_異常応答やファイル作成失敗やNullエンジンを正しく扱う(t *testing.T) {
+	ctx := context.Background()
+	m := newModule()
+
+	// Empty host, empty databases, & Quiesce coverage
+	if _, err := m.DumpSource(ctx, &pb.DumpSourceRequest{
+		Source:  &pb.RefreshSource{Host: "", Port: 8123, Databases: []string{"app"}},
+		OutPath: "/tmp/x",
+	}); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("empty host: %v", err)
+	}
+	if _, err := m.DumpSource(ctx, &pb.DumpSourceRequest{
+		Source:  &pb.RefreshSource{Host: "127.0.0.1", Port: 8123},
+		OutPath: "/tmp/x",
+	}); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("empty databases: %v", err)
+	}
+	if _, err := m.Quiesce(ctx, &pb.QuiesceRequest{}); err != nil {
+		t.Fatalf("Quiesce: %v", err)
+	}
+
+	scenario := ""
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		sql := strings.TrimSpace(string(b))
+		switch {
+		case sql == "SELECT version()":
+			if scenario == "bad_ver_json" {
+				io.WriteString(w, "not json")
+				return
+			}
+			io.WriteString(w, jsonCompact([]string{"version()"}, [][]any{{"26.3.19.3"}}))
+		case strings.Contains(sql, "FROM system.databases"):
+			if scenario == "db_http_err" {
+				w.WriteHeader(http.StatusInternalServerError)
+				io.WriteString(w, "Code: 81. DB error")
+				return
+			}
+			io.WriteString(w, jsonCompact([]string{"name", "engine"}, [][]any{{"app", "Atomic"}}))
+		case strings.Contains(sql, "FROM system.tables"):
+			switch scenario {
+			case "tbl_http_err":
+				w.WriteHeader(http.StatusInternalServerError)
+				io.WriteString(w, "Code: 60. Table list error")
+				return
+			case "bad_tbl_row":
+				io.WriteString(w, jsonCompact([]string{"database"}, [][]any{{"app"}}))
+			case "unexpected_db":
+				io.WriteString(w, jsonCompact([]string{"database", "name", "engine"}, [][]any{{"system", "users", "Memory"}}))
+			case "bad_tbl_ident":
+				io.WriteString(w, jsonCompact([]string{"database", "name", "engine"}, [][]any{{"app", "bad`name", "Memory"}}))
+			case "null_engine":
+				io.WriteString(w, jsonCompact([]string{"database", "name", "engine"}, [][]any{{"app", "sink", "Null"}}))
+			default:
+				io.WriteString(w, jsonCompact([]string{"database", "name", "engine"}, [][]any{{"app", "t", "Memory"}}))
+			}
+		case strings.HasPrefix(sql, "SHOW CREATE TABLE "):
+			switch scenario {
+			case "ddl_http_err":
+				w.WriteHeader(http.StatusInternalServerError)
+				io.WriteString(w, "Code: 60. Unknown table")
+			case "ddl_empty":
+				io.WriteString(w, jsonCompact([]string{"statement"}, [][]any{}))
+			case "null_engine":
+				io.WriteString(w, jsonCompact([]string{"statement"}, [][]any{{"CREATE TABLE app.sink (`x` UInt8) ENGINE = Null"}}))
+			default:
+				io.WriteString(w, jsonCompact([]string{"statement"}, [][]any{{"CREATE TABLE app.t (`x` UInt8) ENGINE = Memory"}}))
+			}
+		case strings.Contains(sql, "FORMAT Native"):
+			w.WriteHeader(http.StatusInternalServerError)
+			io.WriteString(w, "Code: 159. Timeout exceeded for secret-pw")
+		}
+	}))
+	defer srv.Close()
+	h, p := hostPortOf(t, srv)
+
+	for _, sc := range []string{"bad_ver_json", "db_http_err", "tbl_http_err", "bad_tbl_row", "unexpected_db", "bad_tbl_ident", "ddl_http_err", "ddl_empty", "native_err"} {
+		scenario = sc
+		out := filepath.Join(t.TempDir(), sc+".chb")
+		_, err := m.DumpSource(ctx, &pb.DumpSourceRequest{
+			Source:  &pb.RefreshSource{Host: h, Port: p, User: "u", Password: "secret-pw", Databases: []string{"app"}},
+			OutPath: out,
+		})
+		if err == nil {
+			t.Errorf("scenario %s: expected error", sc)
+		} else if strings.Contains(err.Error(), "secret-pw") {
+			t.Errorf("scenario %s: password leaked: %v", sc, err)
+		}
+		if _, statErr := os.Stat(out); statErr == nil {
+			t.Errorf("scenario %s: partial file must not remain", sc)
+		}
+	}
+
+	// Null engine succeeds without issuing SELECT * FORMAT Native, and zero-initialized defaults work too.
+	scenario = "null_engine"
+	outNull := filepath.Join(t.TempDir(), "null.chb")
+	mZero := &module{}
+	if _, err := mZero.DumpSource(ctx, &pb.DumpSourceRequest{
+		Source:  &pb.RefreshSource{Host: h, Port: p, User: "u", Databases: []string{"app"}},
+		OutPath: outNull,
+	}); err != nil {
+		t.Fatalf("Null engine dump failed: %v", err)
+	}
+
+	// Size limit tripped during header write and during HasData=false table write removes partial file.
+	for _, limit := range []int64{10, 200} {
+		mTiny := newModule()
+		mTiny.maxDumpBytes = limit
+		outTiny := filepath.Join(t.TempDir(), "tiny.chb")
+		if _, err := mTiny.DumpSource(ctx, &pb.DumpSourceRequest{
+			Source:  &pb.RefreshSource{Host: h, Port: p, User: "u", Databases: []string{"app"}},
+			OutPath: outTiny,
+		}); status.Code(err) != codes.ResourceExhausted {
+			t.Fatalf("limit %d: got %v, want ResourceExhausted", limit, err)
+		}
+		if _, statErr := os.Stat(outTiny); statErr == nil {
+			t.Fatalf("limit %d: partial file must not remain", limit)
+		}
+	}
+
+	// Unwritable outPath fails cleanly.
+	if _, err := m.DumpSource(ctx, &pb.DumpSourceRequest{
+		Source:  &pb.RefreshSource{Host: h, Port: p, User: "u", Databases: []string{"app"}},
+		OutPath: filepath.Join(t.TempDir(), "no-such-dir", "dump.chb"),
+	}); err == nil {
+		t.Fatal("nonexistent output directory must fail")
 	}
 }
