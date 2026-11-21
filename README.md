@@ -32,7 +32,7 @@ main.go         runtimeplugin.Serve
 module.go       the Runtime gRPC service
 pure.go         config.xml, users.xml, result parsing (no I/O)
 *_test.go       unit tests; integration_test.go (tag integration) runs a real ClickHouse
-scripts/        mkmanifest.py (manifest.json with the digests), sign-manifest.sh, conformance.sh
+scripts/        mkmanifest.py (manifest.json with the digests), sign-manifest.sh, release-asset.sh, conformance.sh
 packaging/      nfpm.yaml, postinst
 ```
 
@@ -64,14 +64,33 @@ initialise, start, clean stop, restart, clone, crash recovery and remove under s
 
 ## Install
 
+### Recommended: `db-branch module install` (GitHub Release `.tar.gz`, no `.deb`)
+
+For third-party deployments or operators who do not use db-branch's APT repository, install the signed release archive directly with `db-branch module install`:
+
+```bash
+sudo db-branch module install github.com/db-branch/db-branch-rt-clickhouse@v<version> \
+  --trust-key sha256:<fingerprint>
 ```
+
+Verify the `sha256:<fingerprint>` value against the [Public key fingerprint](#公開鍵の指紋) section below (or an out-of-band source) before trusting it. Because the release archive ships a signed `manifest.json` verified against `/etc/db-branch/trusted-keys/<key_id>.pub`, `allow_unsigned_runtimes = true` is **not** needed.
+
+### Alternative: `.deb` package
+
+```bash
 apt install ./db-branch-rt-clickhouse_<version>_amd64.deb
 ```
 
-The package ships a **signed** `manifest.json` (Ed25519; the key is in `/etc/db-branch/trusted-keys/`). A module
-without a signature loads only with `allow_unsigned_runtimes = true` in db-branch's `config.toml`, for development.
-Put the ClickHouse binary of the version you want in `/var/lib/db-branch/runtimes/clickhouse/<version>/` until the
-module lists pinned downloads.
+The package ships a **signed** `manifest.json` (Ed25519; the key is in `/etc/db-branch/trusted-keys/`). A module without a signature loads only with `allow_unsigned_runtimes = true` in db-branch's `config.toml`, for development.
+Put the ClickHouse binary of the version you want in `/var/lib/db-branch/runtimes/clickhouse/<version>/` until the module lists pinned downloads.
+
+## 公開鍵の指紋
+
+Release archives bundle `<key_id>.pub` (base64-encoded raw 32-byte Ed25519 public key). Verify its SHA-256 fingerprint before passing `--trust-key`:
+
+| Key ID | SHA-256 Fingerprint |
+|---|---|
+| `db-branch-rt-2026-1` | `sha256:83fa766fc8df1aab8a4e79f3eb252dbb9820bb67945875f6d74c1a9c33a457cd` |
 
 ## Release
 
@@ -85,9 +104,42 @@ chmod 600 /path/to/release-key.pem
 openssl pkey -in /path/to/release-key.pem -pubout -outform DER | tail -c 32 | base64 > <key_id>.pub
 ```
 
-`key_id` must match `^[A-Za-z0-9._-]{1,64}$` (for example `db-branch-2026`).
+`key_id` must match `^[A-Za-z0-9._-]{1,64}$` (without a leading `.` or `..`, for example `db-branch-2026`).
 
-### 2. Build the signed `.deb` package
+### 2. Build signed GitHub Release archives (no `.deb` required)
+
+```bash
+make release VERSION=<version> SIGNING_KEY=/path/to/release-key.pem SIGNING_KEY_ID=<key_id>
+```
+
+`make release` runs `scripts/release-asset.sh` for both `amd64` and `arm64`, producing reproducible flat `.tar.gz` archives and `SHA256SUMS` under `dist/release/`:
+
+- `dist/release/db-branch-rt-clickhouse_<version>_linux_amd64.tar.gz`
+- `dist/release/db-branch-rt-clickhouse_<version>_linux_arm64.tar.gz`
+- `dist/release/SHA256SUMS`
+
+At the end, `make release` prints the public key fingerprint `sha256:<hex>` (SHA-256 of the raw 32-byte public key). Record this fingerprint in the [公開鍵の指紋](#公開鍵の指紋) section above.
+
+### 3. Publish the GitHub Release
+
+Attach the two `.tar.gz` archives and `SHA256SUMS` to a non-draft, non-prerelease GitHub Release whose tag matches `v<version>` (example):
+
+```bash
+gh release create v<version> dist/release/* \
+  --title "v<version>" \
+  --notes "Release v<version>"
+```
+
+Operators can then install the release without `.deb` or `allow_unsigned_runtimes = true`:
+
+```bash
+sudo db-branch module install github.com/db-branch/db-branch-rt-clickhouse@v<version> \
+  --trust-key sha256:<fingerprint>
+```
+
+### 4. Optional: Build the signed `.deb` package
+
+When distributing via `.deb` instead of `db-branch module install` (note: third parties and operators not using db-branch's APT repository should use `db-branch module install` above):
 
 ```bash
 make deb SIGNING_KEY=/path/to/release-key.pem SIGNING_KEY_ID=<key_id> VERSION=0.1.0
@@ -95,23 +147,21 @@ make deb SIGNING_KEY=/path/to/release-key.pem SIGNING_KEY_ID=<key_id> VERSION=0.
 
 `make deb` stages the binary, generates `manifest.json` and `runtimes.json`, signs `manifest.json` into `manifest.json.sig` (rejecting keys with permissions looser than `0600` and self-verifying the signature), and packages `dist/db-branch-rt-clickhouse_<version>_<arch>.deb` with `nfpm`.
 
-### 3. Install the public key on target nodes
-
-Operators install `<key_id>.pub` (base64-encoded 32-byte raw Ed25519 public key) under `/etc/db-branch/trusted-keys/` owned by `root:root` and not writable by group or others:
+When using `.deb`, operators install `<key_id>.pub` (base64-encoded 32-byte raw Ed25519 public key) under `/etc/db-branch/trusted-keys/` owned by `root:root` and not writable by group or others:
 
 ```bash
 sudo install -d -m 0755 -o root -g root /etc/db-branch/trusted-keys
 sudo install -m 0644 -o root -g root <key_id>.pub /etc/db-branch/trusted-keys/<key_id>.pub
 ```
 
-### 4. Key compromise / rotation
+### 5. Key compromise / rotation
 
 If a signing key is leaked or suspected compromised:
 
 1. Generate a new Ed25519 key pair with a new `<new_key_id>`.
-2. Deploy `/etc/db-branch/trusted-keys/<new_key_id>.pub` to all nodes.
-3. Build and distribute a new `.deb` signed with the new key.
-4. Remove the compromised key's `/etc/db-branch/trusted-keys/<old_key_id>.pub` from all nodes.
+2. Publish the new fingerprint and deploy `/etc/db-branch/trusted-keys/<new_key_id>.pub` (or `db-branch module trust add`) to all nodes.
+3. Build and publish a new release signed with the new key (`make release`, and `make deb` if distributing `.deb`).
+4. Remove the compromised key's `/etc/db-branch/trusted-keys/<old_key_id>.pub` (or `sudo db-branch module trust remove <old_key_id>`) from all nodes.
 
 ## Naming
 
