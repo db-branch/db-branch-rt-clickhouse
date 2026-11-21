@@ -7,3 +7,5 @@ go.work.sum
 /packaging/manifest.json.sig
 /packaging/runtimes.json
 /db-branch-rt-clickhouse
+*.pem
+*.key

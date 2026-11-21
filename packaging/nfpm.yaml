@@ -5,20 +5,20 @@ section: database
 priority: optional
 maintainer: db-branch
 description: ClickHouse as a db-branch runtime module
-license: Proprietary
+license: Apache-2.0
 depends:
   - db-branch
 contents:
-  - src: bin/db-branch-rt-clickhouse
+  - src: dist/stage/db-branch-rt-clickhouse
     dst: /usr/lib/db-branch/runtimes/clickhouse/db-branch-rt-clickhouse
     file_info: {mode: 0755, owner: root, group: root}
-  - src: packaging/manifest.json
+  - src: dist/stage/manifest.json
     dst: /usr/lib/db-branch/runtimes/clickhouse/manifest.json
     file_info: {mode: 0644, owner: root, group: root}
-  - src: packaging/manifest.json.sig
+  - src: dist/stage/manifest.json.sig
     dst: /usr/lib/db-branch/runtimes/clickhouse/manifest.json.sig
     file_info: {mode: 0644, owner: root, group: root}
-  - src: packaging/runtimes.json
+  - src: dist/stage/runtimes.json
     dst: /usr/lib/db-branch/runtimes/clickhouse/runtimes.json
     file_info: {mode: 0644, owner: root, group: root}
 scripts:

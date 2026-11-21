@@ -24,8 +24,17 @@ integration: build
 conformance: build
 	scripts/conformance.sh bin/$(BIN) $(CH_BINARY)
 
-deb: build
-	mkdir -p dist
+deb:
+	@if [ -z "$(SIGNING_KEY)" ] || [ -z "$(SIGNING_KEY_ID)" ]; then \
+		echo "usage: make deb SIGNING_KEY=/path/to/key.pem SIGNING_KEY_ID=<key-id> [VERSION=$(VERSION)] [GOARCH=$(GOARCH)]" >&2; \
+		exit 1; \
+	fi
+	$(MAKE) build VERSION=$(VERSION) GOARCH=$(GOARCH)
+	rm -rf dist/stage
+	mkdir -p dist/stage
+	cp bin/$(BIN) dist/stage/$(BIN)
+	python3 scripts/mkmanifest.py $(MODDIR) dist/stage $(VERSION)
+	scripts/sign-manifest.sh dist/stage/manifest.json "$(SIGNING_KEY)" "$(SIGNING_KEY_ID)"
 	VERSION=$(VERSION) GOARCH=$(GOARCH) nfpm package --packager deb --config packaging/nfpm.yaml --target dist/
 
 clean:
