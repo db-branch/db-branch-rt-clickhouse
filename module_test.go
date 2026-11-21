@@ -275,8 +275,10 @@ func TestCatalog_amd64とarm64の両方を同じ版で返す(t *testing.T) {
 		got[e.Version+"/"+e.Platform] = e.Sha256
 	}
 	want := map[string]string{
-		"26.3.19.3/amd64": "8c9886db49555efb6bef2ee08656af0d48bd07c83a08a729abb9d60e26bfff3d",
-		"26.3.19.3/arm64": "f7df37b5c600099bc6e772c9bae2b91a530c6bbc07a2bd5a5021443c742c4c92",
+		"26.3.19.3/amd64":  "8c9886db49555efb6bef2ee08656af0d48bd07c83a08a729abb9d60e26bfff3d",
+		"26.3.19.3/arm64":  "f7df37b5c600099bc6e772c9bae2b91a530c6bbc07a2bd5a5021443c742c4c92",
+		"26.8.42.13/amd64": "921e601ebd7c33dd0f56ae48909b020ab9b85c582ef4e991281edf315dc75e4d",
+		"26.8.42.13/arm64": "321399079464d3bd576ecf4eca3c2a7e642481a935f8245ba6c79fb56998d4a1",
 	}
 	for k, sum := range want {
 		if got[k] != sum {

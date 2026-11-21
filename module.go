@@ -86,6 +86,12 @@ var releases = []*pb.CatalogEntry{
 	{Version: "26.3.19.3", Platform: "arm64", Size: 203799350,
 		Url:    "https://packages.clickhouse.com/tgz/lts/clickhouse-common-static-26.3.19.3-arm64.tgz",
 		Sha256: "f7df37b5c600099bc6e772c9bae2b91a530c6bbc07a2bd5a5021443c742c4c92"},
+	{Version: "26.8.42.13", Platform: "amd64", Size: 237993465,
+		Url:    "https://packages.clickhouse.com/tgz/lts/clickhouse-common-static-26.8.42.13-amd64.tgz",
+		Sha256: "921e601ebd7c33dd0f56ae48909b020ab9b85c582ef4e991281edf315dc75e4d"},
+	{Version: "26.8.42.13", Platform: "arm64", Size: 218848676,
+		Url:    "https://packages.clickhouse.com/tgz/lts/clickhouse-common-static-26.8.42.13-arm64.tgz",
+		Sha256: "321399079464d3bd576ecf4eca3c2a7e642481a935f8245ba6c79fb56998d4a1"},
 }
 
 func (m *module) Catalog(context.Context, *pb.CatalogRequest) (*pb.CatalogResponse, error) {
