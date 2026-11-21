@@ -4,10 +4,14 @@ ClickHouse as a [db-branch](https://github.com/db-branch/db-branch) **runtime mo
 ClickHouse databases the way it branches MySQL and PostgreSQL (ZFS clones, per-branch logins, checkpoints).
 
 > Status: **beta**. Only the HTTP interface is opened (no native protocol on 9000). The module lists ClickHouse
-> 26.3 LTS (x86_64) and db-branch downloads and verifies it; arm64 is not listed yet. It needs a db-branch with
-> runtime-module support (on db-branch `main`, not in a tagged release yet; see "Develop"). The package is not
-> signed yet: until it is, load it with `allow_unsigned_runtimes = true`. Tested on a 4-node cluster (create,
-> branch, isolation, restricted logins, checkpoint restore, reset); not load-tested.
+> 26.3 LTS and 26.8 LTS (x86_64 and arm64; archives are pinned by SHA-256, checked against ClickHouse's published
+> `.sha512`) and db-branch downloads and verifies them. It supports live freeze around checkpoints, upgrades
+> between versions (`db-branch branch upgrade`) and loading a base from a source ClickHouse (`db-branch base
+> refresh`). It needs a db-branch with `module install` and the external-engine upgrade and dump support (db-branch
+> `main` from 557a9a8; no tagged db-branch release has them yet). Install it from the GitHub Release with
+> `db-branch module install` (see "Install"). Tested on a 4-node x86_64 cluster (create, branch, isolation,
+> restricted logins, checkpoint restore, reset, live freeze, upgrade 26.3 -> 26.8, base from a source ClickHouse);
+> the arm64 archives are checked by digest only, not run on arm64 hardware; not load-tested.
 
 ## What it is
 
