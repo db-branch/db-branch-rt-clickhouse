@@ -3,8 +3,11 @@
 ClickHouse as a [db-branch](https://github.com/db-branch/db-branch) **runtime module**: with it, `db-branch` branches
 ClickHouse databases the way it branches MySQL and PostgreSQL (ZFS clones, per-branch logins, checkpoints).
 
-> Status: prototype. Only the HTTP interface is opened, the runtime (the single `clickhouse` binary) is put in
-> place by hand, and the module lists no downloads yet.
+> Status: **beta**. Only the HTTP interface is opened (no native protocol on 9000). The module lists ClickHouse
+> 26.3 LTS (x86_64) and db-branch downloads and verifies it; arm64 is not listed yet. It needs a db-branch that
+> has the runtime-module support (not in a release yet, see "Develop"). The package is not signed yet: until it
+> is, load it with `allow_unsigned_runtimes = true`. Tested on a 4-node cluster (create, branch, isolation,
+> restricted logins, checkpoint restore, reset); not load-tested.
 
 ## What it is
 
