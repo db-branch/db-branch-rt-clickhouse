@@ -4,10 +4,10 @@ ClickHouse as a [db-branch](https://github.com/db-branch/db-branch) **runtime mo
 ClickHouse databases the way it branches MySQL and PostgreSQL (ZFS clones, per-branch logins, checkpoints).
 
 > Status: **beta**. Only the HTTP interface is opened (no native protocol on 9000). The module lists ClickHouse
-> 26.3 LTS (x86_64) and db-branch downloads and verifies it; arm64 is not listed yet. It needs a db-branch that
-> has the runtime-module support (not in a release yet, see "Develop"). The package is not signed yet: until it
-> is, load it with `allow_unsigned_runtimes = true`. Tested on a 4-node cluster (create, branch, isolation,
-> restricted logins, checkpoint restore, reset); not load-tested.
+> 26.3 LTS (x86_64) and db-branch downloads and verifies it; arm64 is not listed yet. It needs a db-branch with
+> runtime-module support (on db-branch `main`, not in a tagged release yet; see "Develop"). The package is not
+> signed yet: until it is, load it with `allow_unsigned_runtimes = true`. Tested on a 4-node cluster (create,
+> branch, isolation, restricted logins, checkpoint restore, reset); not load-tested.
 
 ## What it is
 
@@ -38,21 +38,24 @@ packaging/      nfpm.yaml, postinst
 
 ## Develop
 
-db-branch's `pkg/ext/proto/runtime/v1` and `pkg/ext/runtimeplugin` are not in a release yet, so this repository is
-built against a checkout of db-branch through `go.work` (not committed):
-
-```
-go 1.27.3
-use (
-	.
-	../db-branch      # a checkout that has pkg/ext/runtimeplugin
-)
-```
+No `go.work` is needed: `go.mod` pins `github.com/db-branch/db-branch` to a pseudo-version from `main` (to be
+updated once a tagged release with `pkg/ext/proto/runtime/v1` and `pkg/ext/runtimeplugin` is published).
 
 ```
 make test                                  # unit tests
 make integration CH_BINARY=/path/clickhouse   # a real ClickHouse, current user, no systemd
 sudo make conformance CH_BINARY=/path/clickhouse   # db-branch-conformance --lifecycle (root, systemd)
+```
+
+If you are developing against local changes in `db-branch` at the same time, create a `go.work` (gitignored) next
+to `go.mod`:
+
+```
+go 1.27.3
+use (
+	.
+	../db-branch
+)
 ```
 
 `db-branch-conformance` is the contract check of db-branch (`cmd/db-branch-conformance`): the manifest equals
