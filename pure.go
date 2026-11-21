@@ -178,3 +178,208 @@ func splitStatements(sql string) []string {
 	flush()
 	return out
 }
+
+// freezeState is carried in FreezeToken.Data so PostFreeze knows which instance
+// was frozen and what PreFreeze stopped.
+type freezeState struct {
+	Host          string `json:"host,omitempty"`
+	Port          int32  `json:"port,omitempty"`
+	StoppedMerges bool   `json:"stopped_merges"`
+	StoppedMoves  bool   `json:"stopped_moves"`
+}
+
+func encodeFreezeToken(st freezeState) string {
+	b, _ := json.Marshal(st)
+	return string(b)
+}
+
+func decodeFreezeToken(data string) (freezeState, bool) {
+	if strings.TrimSpace(data) == "" {
+		return freezeState{}, false
+	}
+	var st freezeState
+	if err := json.Unmarshal([]byte(data), &st); err != nil {
+		return freezeState{}, false
+	}
+	return st, true
+}
+
+// parseCounts reads want non-negative integer counts from the first row of a
+// ClickHouse JSONCompact response (UInt64 values arrive as JSON strings).
+func parseCounts(body []byte, want int) ([]int64, error) {
+	res, err := parseResult(body, 0)
+	if err != nil {
+		return nil, err
+	}
+	if len(res.Rows) == 0 || len(res.Rows[0].Cells) < want {
+		return nil, fmt.Errorf("unexpected row shape from ClickHouse: got %d row(s)", len(res.Rows))
+	}
+	out := make([]int64, want)
+	for i := 0; i < want; i++ {
+		c := res.Rows[0].Cells[i]
+		if c.IsNull {
+			return nil, fmt.Errorf("unexpected NULL at column %d", i)
+		}
+		n, err := strconv.ParseInt(strings.TrimSpace(c.Value), 10, 64)
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("invalid count %q at column %d", c.Value, i)
+		}
+		out[i] = n
+	}
+	return out, nil
+}
+
+// parseCHVersion parses a ClickHouse numeric version string (e.g. "26.3.19.3"
+// or "1.0", matching Describe.VersionPattern).
+func parseCHVersion(s string) ([]int, error) {
+	parts := strings.Split(s, ".")
+	if len(parts) < 2 {
+		return nil, fmt.Errorf("invalid ClickHouse version %q", s)
+	}
+	nums := make([]int, len(parts))
+	for i, p := range parts {
+		if p == "" {
+			return nil, fmt.Errorf("invalid ClickHouse version %q", s)
+		}
+		for j := 0; j < len(p); j++ {
+			if p[j] < '0' || p[j] > '9' {
+				return nil, fmt.Errorf("invalid ClickHouse version %q", s)
+			}
+		}
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return nil, fmt.Errorf("invalid ClickHouse version %q: %w", s, err)
+		}
+		nums[i] = n
+	}
+	return nums, nil
+}
+
+func compareCHVersions(a, b []int) int {
+	n := len(a)
+	if len(b) > n {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		var va, vb int
+		if i < len(a) {
+			va = a[i]
+		}
+		if i < len(b) {
+			vb = b[i]
+		}
+		if va < vb {
+			return -1
+		}
+		if va > vb {
+			return 1
+		}
+	}
+	return 0
+}
+
+// checkUpgradePath allows moving to a strictly newer ClickHouse version and
+// refuses the same version or any downgrade.
+func checkUpgradePath(from, to string) error {
+	a, err := parseCHVersion(from)
+	if err != nil {
+		return fmt.Errorf("from version: %w", err)
+	}
+	b, err := parseCHVersion(to)
+	if err != nil {
+		return fmt.Errorf("to version: %w", err)
+	}
+	switch compareCHVersions(a, b) {
+	case 0:
+		return fmt.Errorf("already running ClickHouse %s", from)
+	case 1:
+		return fmt.Errorf("downgrade from ClickHouse %s to %s is not supported", from, to)
+	}
+	return nil
+}
+
+func isClickHouseLTS(month int) bool { return month == 3 || month == 8 }
+
+// ltsBefore returns the count of ClickHouse LTS releases (.3, .8) strictly before (y, m).
+func ltsBefore(y, m int) int {
+	switch {
+	case m <= 3:
+		return 2 * y
+	case m <= 8:
+		return 2*y + 1
+	default:
+		return 2*y + 2
+	}
+}
+
+// ltsAtMost returns the count of ClickHouse LTS releases (.3, .8) at or before (y, m).
+func ltsAtMost(y, m int) int {
+	switch {
+	case m < 3:
+		return 2 * y
+	case m < 8:
+		return 2*y + 1
+	default:
+		return 2*y + 2
+	}
+}
+
+// upgradePathWarnings returns non-blocking warnings when an upgrade skips
+// ClickHouse LTS releases, targets a non-LTS release, or skips intermediate
+// minor releases from a non-LTS release.
+func upgradePathWarnings(from, to string) []*pb.Finding {
+	a, err1 := parseCHVersion(from)
+	b, err2 := parseCHVersion(to)
+	if err1 != nil || err2 != nil || compareCHVersions(a, b) >= 0 {
+		return nil
+	}
+	fy, fm := a[0], a[1]
+	ty, tm := b[0], b[1]
+	if fy == ty && fm == tm {
+		return nil
+	}
+	if fm < 1 || fm > 12 || tm < 1 || tm > 12 {
+		return nil
+	}
+	var out []*pb.Finding
+	if skipped := ltsBefore(ty, tm) - ltsAtMost(fy, fm); skipped > 0 {
+		start := ltsAtMost(fy, fm)
+		const maxListed = 4
+		show := skipped
+		if show > maxListed {
+			show = maxListed
+		}
+		names := make([]string, 0, show)
+		for k := 0; k < show; k++ {
+			idx := start + k
+			month := 3
+			if idx%2 == 1 {
+				month = 8
+			}
+			names = append(names, fmt.Sprintf("%d.%d", idx/2, month))
+		}
+		summary := strings.Join(names, ", ")
+		if skipped > maxListed {
+			summary += fmt.Sprintf(" and %d more", skipped-maxListed)
+		}
+		out = append(out, &pb.Finding{
+			Level:   "warning",
+			Code:    "upgrade_path",
+			Message: fmt.Sprintf("upgrading ClickHouse from %s to %s skips LTS release(s) (%s); review release notes for breaking changes", from, to, summary),
+		})
+	}
+	if !isClickHouseLTS(tm) {
+		out = append(out, &pb.Finding{
+			Level:   "warning",
+			Code:    "upgrade_path",
+			Message: fmt.Sprintf("ClickHouse %s is not an LTS release (LTS releases are .3 and .8); review release notes for minor version changes", to),
+		})
+	} else if len(out) == 0 && !isClickHouseLTS(fm) && (ty*12+tm)-(fy*12+fm) > 1 {
+		out = append(out, &pb.Finding{
+			Level:   "warning",
+			Code:    "upgrade_path",
+			Message: fmt.Sprintf("upgrading ClickHouse from %s to %s skips intermediate minor releases; review release notes for breaking changes", from, to),
+		})
+	}
+	return out
+}

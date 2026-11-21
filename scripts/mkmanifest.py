@@ -65,7 +65,12 @@ def main():
         "collation_bound": False,
         "zfs_props": {"recordsize": "128K", "compression": "lz4"},
         "protocols": [{"name": "http", "primary": True}],
-        "capabilities": {"query": True, "checkpoints": True},
+        "capabilities": {
+            "query": True,
+            "checkpoints": True,
+            "live_freeze": True,
+            "upgrade": True,
+        },
         "systemd": {
             "service_type": "simple",
             "kill_signal": "SIGTERM",

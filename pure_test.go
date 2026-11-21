@@ -175,3 +175,130 @@ func TestServerConfig_ブランチのメモリ設定はキャッシュ分でサ�
 		t.Fatalf("a small branch still needs room for the server:\n%s", c)
 	}
 }
+
+func TestCheckUpgradePathPure_ClickHouseの4要素の版を数値で比較し新しい版だけ許可する(t *testing.T) {
+	okCases := [][2]string{
+		{"26.3.19.3", "26.3.19.4"},
+		{"26.3.2.1", "26.3.19.3"},   // 数値比較: 2 < 19 (辞書順ではない)
+		{"25.8.1.100", "26.3.19.3"}, // 隣接 LTS
+		{"24.8.1.1", "26.3.19.3"},   // LTS 飛び越しでも拒否しない
+		{"26.3.19.3", "26.4.1.1"},   // 非 LTS でも拒否しない
+		{"1.0", "2.0"},              // 2 要素の版 (conformance プローブ)
+		{"26.3", "26.3.0.1"},        // 要素数が違っても 0 詰めで比較
+	}
+	for _, c := range okCases {
+		if err := checkUpgradePath(c[0], c[1]); err != nil {
+			t.Errorf("%s -> %s: unexpected error: %v", c[0], c[1], err)
+		}
+	}
+
+	badCases := [][2]string{
+		{"26.3.19.3", "26.3.19.3"},                 // 同じ版
+		{"26.3", "26.3.0.0"},                       // 数値的に同じ版
+		{"26.3.19.3", "26.3.19.2"},                 // ダウングレード
+		{"26.3.19.3", "26.3.2.99"},                 // 数値比較でダウングレード
+		{"26.3.19.3", "25.8.99.99"},                // 年のダウングレード
+		{"", "26.3.19.3"},                          // 空
+		{"26", "26.3.19.3"},                        // 1 要素は不正
+		{"26.3.19.3", "26.3.a.1"},                  // 非数値
+		{"26..3", "26.4"},                          // 空セグメント
+		{"26.3.19.3", "99999999999999999999999.1"}, // オーバーフロー
+	}
+	for _, c := range badCases {
+		if err := checkUpgradePath(c[0], c[1]); err == nil {
+			t.Errorf("%s -> %s: expected error, got nil", c[0], c[1])
+		}
+	}
+}
+
+func TestUpgradePathWarnings_LTS飛ばしや非LTS移行は警告を返し同シリーズや隣接LTSは警告しない(t *testing.T) {
+	noWarn := [][2]string{
+		{"26.3.1.1", "26.3.19.3"}, // 同一シリーズ内のパッチ更新
+		{"25.8.1.1", "26.3.19.3"}, // 隣接 LTS (.8 -> 翌年 .3)
+		{"26.3.19.3", "26.8.1.1"}, // 隣接 LTS (.3 -> 同年 .8)
+	}
+	for _, c := range noWarn {
+		if ws := upgradePathWarnings(c[0], c[1]); len(ws) != 0 {
+			t.Errorf("%s -> %s: expected no warning, got %+v", c[0], c[1], ws)
+		}
+	}
+
+	// LTS を飛ばすケース (24.8 -> 26.3 は 25.3, 25.8 を飛ばす)
+	ws := upgradePathWarnings("24.8.1.1", "26.3.19.3")
+	if len(ws) == 0 || ws[0].Level != "warning" || ws[0].Code != "upgrade_path" ||
+		!strings.Contains(ws[0].Message, "25.3") || !strings.Contains(ws[0].Message, "25.8") {
+		t.Fatalf("skipping LTS must warn with skipped versions: %+v", ws)
+	}
+
+	// 多数の LTS を飛ばしても O(1) で要約して警告する
+	wsMany := upgradePathWarnings("20.3.1.1", "30.8.1.1")
+	if len(wsMany) == 0 || wsMany[0].Level != "warning" || !strings.Contains(wsMany[0].Message, "more") {
+		t.Fatalf("many skipped LTS must be summarized: %+v", wsMany)
+	}
+
+	// 非 LTS への移行は警告する
+	wsNonLTS := upgradePathWarnings("26.3.19.3", "26.4.1.1")
+	if len(wsNonLTS) == 0 || wsNonLTS[0].Level != "warning" || !strings.Contains(wsNonLTS[0].Message, "LTS") {
+		t.Fatalf("non-LTS target must warn: %+v", wsNonLTS)
+	}
+
+	// 非 LTS 間でマイナーを飛ばすケース (26.4 -> 26.8 は 26.5..26.7 を飛ばす)
+	wsMinorSkip := upgradePathWarnings("26.4.1.1", "26.8.1.1")
+	if len(wsMinorSkip) == 0 || wsMinorSkip[0].Level != "warning" {
+		t.Fatalf("skipping minor releases from non-LTS must warn: %+v", wsMinorSkip)
+	}
+
+	// 月が 1..2 や 9..12 のケースでも LTS 飛び越しと非 LTS を正しく検出する
+	wsLate := upgradePathWarnings("25.10.1.1", "26.10.1.1")
+	if len(wsLate) != 2 || !strings.Contains(wsLate[0].Message, "26.3") || !strings.Contains(wsLate[0].Message, "26.8") {
+		t.Fatalf("late-month LTS skip + non-LTS target: %+v", wsLate)
+	}
+	wsEarly := upgradePathWarnings("25.1.1.1", "25.5.1.1")
+	if len(wsEarly) != 2 || !strings.Contains(wsEarly[0].Message, "25.3") {
+		t.Fatalf("early-month LTS skip + non-LTS target: %+v", wsEarly)
+	}
+
+	// 不正な版・ダウングレード・月が範囲外(1.0 -> 2.0)はパニックせず警告なし
+	for _, c := range [][2]string{{"bad", "26.3"}, {"26.3", "25.8"}, {"1.0", "2.0"}} {
+		if ws := upgradePathWarnings(c[0], c[1]); len(ws) != 0 {
+			t.Errorf("%s -> %s: expected no warnings, got %+v", c[0], c[1], ws)
+		}
+	}
+}
+
+func TestParseCounts_JSONCompactから件数を読み取り不正な応答は拒否する(t *testing.T) {
+	got, err := parseCounts([]byte(`{"meta":[{"name":"c","type":"UInt64"}],"data":[["0"]],"rows":1}`), 1)
+	if err != nil || len(got) != 1 || got[0] != 0 {
+		t.Fatalf("string UInt64: %v %v", got, err)
+	}
+	got, err = parseCounts([]byte(`{"meta":[{"name":"t"},{"name":"p"}],"data":[[3,"12"]],"rows":1}`), 2)
+	if err != nil || len(got) != 2 || got[0] != 3 || got[1] != 12 {
+		t.Fatalf("two counts: %v %v", got, err)
+	}
+	for _, bad := range []string{
+		`not json`,
+		`{"meta":[{"name":"c"}],"data":[],"rows":0}`,
+		`{"meta":[{"name":"c"}],"data":[[null]],"rows":1}`,
+		`{"meta":[{"name":"c"}],"data":[["abc"]],"rows":1}`,
+		`{"meta":[{"name":"c"}],"data":[["-1"]],"rows":1}`,
+	} {
+		if _, err := parseCounts([]byte(bad), 1); err == nil {
+			t.Errorf("expected error for %s", bad)
+		}
+	}
+}
+
+func TestFreezeToken_凍結状態を往復でき空や壊れたトークンはfalseを返す(t *testing.T) {
+	want := freezeState{Host: "127.0.0.1", Port: 18123, StoppedMerges: true, StoppedMoves: true}
+	tok := encodeFreezeToken(want)
+	got, ok := decodeFreezeToken(tok)
+	if !ok || got != want {
+		t.Fatalf("roundtrip = %+v (ok=%v), want %+v", got, ok, want)
+	}
+	if _, ok := decodeFreezeToken(""); ok {
+		t.Fatal("empty token must decode as ok=false")
+	}
+	if _, ok := decodeFreezeToken("{broken"); ok {
+		t.Fatal("corrupt token must decode as ok=false")
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -22,18 +23,32 @@ import (
 	pb "github.com/db-branch/db-branch/pkg/ext/proto/runtime/v1"
 )
 
-const osUser = "db-branch-rt-clickhouse"
+const (
+	osUser = "db-branch-rt-clickhouse"
+
+	// defaultFreezeTimeout caps how long PreFreeze waits for running merges to
+	// drain (matching the core's defaultFreezeTimeout of 5s in livefreeze.go).
+	defaultFreezeTimeout      = 5 * time.Second
+	defaultFreezePollInterval = 50 * time.Millisecond
+	unfreezeRollbackTimeout   = 5 * time.Second
+)
 
 type module struct {
 	pb.UnimplementedRuntimeServer
-	http *http.Client
+	http               *http.Client
+	freezeTimeout      time.Duration
+	freezePollInterval time.Duration
 }
 
 // newModule's HTTP client does not keep connections: ClickHouse waits for the
 // connections left open when it is told to stop (5 seconds, then it ends without
 // its clean shutdown), and the module would be the one holding them.
 func newModule() *module {
-	return &module{http: &http.Client{Timeout: 5 * time.Minute, Transport: &http.Transport{DisableKeepAlives: true}}}
+	return &module{
+		http:               &http.Client{Timeout: 5 * time.Minute, Transport: &http.Transport{DisableKeepAlives: true}},
+		freezeTimeout:      defaultFreezeTimeout,
+		freezePollInterval: defaultFreezePollInterval,
+	}
 }
 
 func internal(err error) error { return status.Error(codes.Internal, err.Error()) }
@@ -44,7 +59,7 @@ func (m *module) Describe(context.Context, *pb.DescribeRequest) (*pb.EngineSpec,
 		Engine: "clickhouse", DisplayName: "ClickHouse", RunAsUser: osUser, VersionPattern: `^[0-9]+\.[0-9]+(\.[0-9]+)*$`,
 		ZfsProps:     map[string]string{"recordsize": "128K", "compression": "lz4"},
 		Protocols:    []*pb.ProtocolPort{{Name: "http", Primary: true}},
-		Capabilities: &pb.Capabilities{Query: true, Checkpoints: true},
+		Capabilities: &pb.Capabilities{Query: true, Checkpoints: true, LiveFreeze: true, Upgrade: true},
 	}, nil
 }
 
@@ -267,6 +282,244 @@ func (m *module) TailLog(_ context.Context, r *pb.TailLogRequest) (*pb.TailLogRe
 		lines = lines[len(lines)-n:]
 	}
 	return &pb.TailLogResponse{Text: strings.Join(lines, "\n") + "\n"}, nil
+}
+
+func adminHost(i *pb.InstanceSpec) string {
+	host := i.GetBind()
+	if host == "" || host == "0.0.0.0" || host == "::" || i.GetMaintenance() {
+		return "127.0.0.1"
+	}
+	return host
+}
+
+func (m *module) runAdmin(ctx context.Context, i *pb.InstanceSpec, sql string) ([]byte, error) {
+	return m.run(ctx, i, adminHost(i), "admin", "", sql, 0)
+}
+
+func (m *module) resumeBackground(ctx context.Context, i *pb.InstanceSpec) error {
+	_, errMoves := m.runAdmin(ctx, i, "SYSTEM START MOVES")
+	_, errMerges := m.runAdmin(ctx, i, "SYSTEM START MERGES")
+	switch {
+	case errMoves != nil && errMerges != nil:
+		return internal(errors.Join(errMoves, errMerges))
+	case errMoves != nil:
+		return errMoves
+	default:
+		return errMerges
+	}
+}
+
+// PreFreeze flushes pending async inserts, stops background merges and moves,
+// and waits (up to freezeTimeout) for in-flight merges to finish so ZFS takes
+// a cleaner snapshot. On any failure or timeout it resumes moves and merges
+// before returning the error.
+func (m *module) PreFreeze(ctx context.Context, r *pb.InstanceRequest) (*pb.FreezeToken, error) {
+	i := r.GetInstance()
+	if i == nil || i.Ports["http"] == 0 {
+		return nil, status.Error(codes.InvalidArgument, "no http port was allocated")
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, m.freezeTimeout)
+	defer cancel()
+
+	if _, err := m.runAdmin(waitCtx, i, "SYSTEM FLUSH ASYNC INSERT QUEUE"); err != nil {
+		return nil, err
+	}
+	rollback := func() error {
+		rbCtx, rbCancel := context.WithTimeout(context.WithoutCancel(ctx), unfreezeRollbackTimeout)
+		defer rbCancel()
+		return m.resumeBackground(rbCtx, i)
+	}
+	if _, err := m.runAdmin(waitCtx, i, "SYSTEM STOP MERGES"); err != nil {
+		_ = rollback()
+		return nil, err
+	}
+	if _, err := m.runAdmin(waitCtx, i, "SYSTEM STOP MOVES"); err != nil {
+		_ = rollback()
+		return nil, err
+	}
+
+	var remaining int64
+	for {
+		body, err := m.runAdmin(waitCtx, i, "SELECT count() FROM system.merges")
+		if err != nil {
+			rbErr := rollback()
+			if waitCtx.Err() != nil {
+				return nil, freezeTimeoutErr(remaining, rbErr)
+			}
+			return nil, err
+		}
+		counts, err := parseCounts(body, 1)
+		if err != nil {
+			_ = rollback()
+			return nil, internal(err)
+		}
+		remaining = counts[0]
+		if remaining == 0 {
+			return &pb.FreezeToken{
+				Data: encodeFreezeToken(freezeState{
+					Host:          adminHost(i),
+					Port:          i.Ports["http"],
+					StoppedMerges: true,
+					StoppedMoves:  true,
+				}),
+			}, nil
+		}
+		timer := time.NewTimer(m.freezePollInterval)
+		select {
+		case <-waitCtx.Done():
+			timer.Stop()
+			rbErr := rollback()
+			return nil, freezeTimeoutErr(remaining, rbErr)
+		case <-timer.C:
+		}
+	}
+}
+
+func freezeTimeoutErr(remaining int64, rbErr error) error {
+	if rbErr != nil {
+		return status.Errorf(codes.DeadlineExceeded, "timed out waiting for %d running merge(s) to finish (rollback failed: %v)", remaining, rbErr)
+	}
+	return status.Errorf(codes.DeadlineExceeded, "timed out waiting for %d running merge(s) to finish", remaining)
+}
+
+// PostFreeze resumes background moves and merges. It is idempotent and works
+// even with an empty token (crash recovery after an agent restart).
+func (m *module) PostFreeze(ctx context.Context, r *pb.PostFreezeRequest) (*pb.Empty, error) {
+	i := r.GetInstance()
+	if i == nil || i.Ports["http"] == 0 {
+		if st, ok := decodeFreezeToken(r.GetToken().GetData()); ok && st.Port != 0 {
+			i = &pb.InstanceSpec{Bind: st.Host, Ports: map[string]int32{"http": st.Port}}
+		} else {
+			return nil, status.Error(codes.InvalidArgument, "no http port was allocated")
+		}
+	}
+	if err := m.resumeBackground(ctx, i); err != nil {
+		return nil, err
+	}
+	return ok()
+}
+
+// CheckUpgradePath allows moving to a strictly newer ClickHouse version and
+// refuses the same version or any downgrade. Skipping LTS or minor releases is
+// allowed here (the RPC carries no warnings) and reported as a warning in
+// CheckUpgrade's UpgradePlan.
+func (m *module) CheckUpgradePath(_ context.Context, r *pb.CheckUpgradePathRequest) (*pb.Empty, error) {
+	from, to := r.GetFromVersion(), r.GetToVersion()
+	if _, err := parseCHVersion(from); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "from version: %v", err)
+	}
+	if _, err := parseCHVersion(to); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "to version: %v", err)
+	}
+	if err := checkUpgradePath(from, to); err != nil {
+		return nil, status.Error(codes.FailedPrecondition, err.Error())
+	}
+	return ok()
+}
+
+func hasInstalledBinary(currentRuntimeDir, toVersion string) bool {
+	if currentRuntimeDir == "" {
+		return false
+	}
+	targetDir := filepath.Join(filepath.Dir(filepath.Clean(currentRuntimeDir)), toVersion)
+	fi, err := os.Stat(binary(targetDir))
+	return err == nil && !fi.IsDir() && fi.Mode().Perm()&0o111 != 0
+}
+
+const upgradeInspectSQL = "SELECT (SELECT count() FROM system.tables WHERE database NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema')), " +
+	"(SELECT count() FROM system.parts WHERE active AND database NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema'))"
+
+// CheckUpgrade verifies without side effects that the target runtime is
+// installed, DataDir is readable, and the running ClickHouse server answers a
+// lightweight metadata query.
+func (m *module) CheckUpgrade(ctx context.Context, r *pb.CheckUpgradeRequest) (*pb.UpgradePlan, error) {
+	i := r.GetInstance()
+	to := r.GetToVersion()
+	if i == nil || to == "" {
+		return nil, status.Error(codes.InvalidArgument, "instance and to_version are required")
+	}
+	if i.Ports["http"] == 0 {
+		return nil, status.Error(codes.InvalidArgument, "no http port was allocated")
+	}
+	if _, err := parseCHVersion(to); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "to version: %v", err)
+	}
+	if i.DataDir == "" {
+		return nil, status.Error(codes.FailedPrecondition, "data directory is empty")
+	}
+	if _, err := os.ReadDir(i.DataDir); err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "data directory %s is not readable: %v", i.DataDir, err)
+	}
+	body, err := m.runAdmin(ctx, i, upgradeInspectSQL)
+	if err != nil {
+		return nil, err
+	}
+	counts, err := parseCounts(body, 2)
+	if err != nil {
+		return nil, internal(err)
+	}
+
+	plan := &pb.UpgradePlan{}
+	if i.Version != "" {
+		if err := checkUpgradePath(i.Version, to); err != nil {
+			plan.Findings = append(plan.Findings, &pb.Finding{
+				Level: "error", Code: "upgrade_path", Message: err.Error(),
+			})
+		} else {
+			plan.Findings = append(plan.Findings, upgradePathWarnings(i.Version, to)...)
+		}
+	}
+	if !hasInstalledBinary(i.RuntimeDir, to) {
+		plan.Findings = append(plan.Findings, &pb.Finding{
+			Level:   "error",
+			Code:    "runtime_not_installed",
+			Message: fmt.Sprintf("ClickHouse %s runtime binary is not installed", to),
+		})
+	}
+	fromLabel := i.Version
+	if fromLabel == "" {
+		fromLabel = "current"
+	}
+	plan.Findings = append(plan.Findings, &pb.Finding{
+		Level:   "info",
+		Code:    "upgrade_path",
+		Message: fmt.Sprintf("ClickHouse %s to %s: %d user table(s), %d active part(s)", fromLabel, to, counts[0], counts[1]),
+	})
+	return plan, nil
+}
+
+// StartUpgraded prepares configuration and LaunchPlan for the new ClickHouse
+// runtime using the same protocol and user rules as PrepareStart; the core
+// stops the old server and starts the new one.
+func (m *module) StartUpgraded(ctx context.Context, r *pb.StartUpgradedRequest) (*pb.StartUpgradedResponse, error) {
+	i := r.GetInstance()
+	if i == nil {
+		return nil, status.Error(codes.InvalidArgument, "instance is required")
+	}
+	if i.Ports["http"] == 0 {
+		return nil, status.Error(codes.InvalidArgument, "no http port was allocated")
+	}
+	if login := r.GetLogin(); login != nil && login.GetUser() != "" && login.GetPassword() != "" {
+		if _, err := m.CreateUser(ctx, &pb.CreateUserRequest{Instance: i, User: login.User, Password: login.Password}); err != nil {
+			return nil, err
+		}
+	}
+	plan, err := m.PrepareStart(ctx, &pb.InstanceRequest{Instance: i})
+	if err != nil {
+		return nil, err
+	}
+	msg := fmt.Sprintf("starting upgraded ClickHouse with %s", plan.Command)
+	if i.Version != "" {
+		msg = fmt.Sprintf("starting ClickHouse %s with %s", i.Version, plan.Command)
+	}
+	return &pb.StartUpgradedResponse{
+		Plan: plan,
+		Findings: []*pb.Finding{{
+			Level:   "info",
+			Code:    "log_upgrade",
+			Message: msg,
+		}},
+	}, nil
 }
 
 func readLogins(stateDir string) (map[string]string, error) {

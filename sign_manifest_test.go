@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -245,5 +247,63 @@ func TestMkmanifest_ステージングからSHA256を計算しインストール
 		m.Catalog != installDir+"/runtimes.json" ||
 		m.CatalogSHA256 != hex.EncodeToString(wantCatSum[:]) {
 		t.Fatalf("unexpected manifest: %+v", m)
+	}
+}
+
+func TestMkmanifestとDescribe_宣言する能力と仕様が一致する(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not found")
+	}
+	stage := t.TempDir()
+	if err := os.WriteFile(filepath.Join(stage, "db-branch-rt-clickhouse"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("python3", "scripts/mkmanifest.py", "/usr/lib/db-branch/runtimes/clickhouse", stage, "0.2.3").CombinedOutput(); err != nil {
+		t.Fatalf("mkmanifest.py failed: %v: %s", err, out)
+	}
+	manData, err := os.ReadFile(filepath.Join(stage, "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m struct {
+		Engine         string            `json:"engine"`
+		DisplayName    string            `json:"display_name"`
+		RunAsUser      string            `json:"run_as_user"`
+		CollationBound bool              `json:"collation_bound"`
+		ZfsProps       map[string]string `json:"zfs_props"`
+		Capabilities   map[string]bool   `json:"capabilities"`
+	}
+	if err := json.Unmarshal(manData, &m); err != nil {
+		t.Fatal(err)
+	}
+	d, err := newModule().Describe(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := d.GetCapabilities()
+	wantCaps := map[string]bool{
+		"query":            c.GetQuery(),
+		"checkpoints":      c.GetCheckpoints(),
+		"live_freeze":      c.GetLiveFreeze(),
+		"upgrade":          c.GetUpgrade(),
+		"source_dump":      c.GetSourceDump(),
+		"branch_merge":     c.GetBranchMerge(),
+		"history_record":   c.GetHistoryRecord(),
+		"update_stats":     c.GetUpdateStats(),
+		"instance_metrics": c.GetInstanceMetrics(),
+	}
+	if m.Engine != d.Engine || m.DisplayName != d.DisplayName || m.RunAsUser != d.RunAsUser ||
+		m.CollationBound != d.CollationBound || !reflect.DeepEqual(m.ZfsProps, d.ZfsProps) {
+		t.Fatalf("manifest spec %+v differs from Describe %+v", m, d)
+	}
+	for k, want := range wantCaps {
+		if m.Capabilities[k] != want {
+			t.Errorf("capability %q: manifest=%v, Describe=%v", k, m.Capabilities[k], want)
+		}
+	}
+	for k := range m.Capabilities {
+		if _, ok := wantCaps[k]; !ok {
+			t.Errorf("unknown capability key %q in manifest.json", k)
+		}
 	}
 }
